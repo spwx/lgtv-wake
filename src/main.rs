@@ -43,7 +43,7 @@ enum Command {
     Setup(setup::Options),
     /// Download the latest release and run its setup (Linux only)
     Update(update::Options),
-    /// Watch a controller's event device and drive the TV (Linux only)
+    /// Watch a controller, keyboard or mouse event device and drive the TV (Linux only)
     Watch {
         /// Event device, e.g. /dev/input/event17
         device: PathBuf,

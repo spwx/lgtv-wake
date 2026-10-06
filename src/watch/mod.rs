@@ -1,15 +1,29 @@
-//! `watch <device>`: per-controller evdev loop (Linux only), driving `machine`.
+//! `watch <device>`: per-device evdev loop (Linux only). A controller drives `machine`; a
+//! keyboard or mouse turns the TV on with a key press or click.
 
 pub mod machine;
 
 use std::ffi::OsStr;
 use std::fs;
 use std::io;
+use std::ops::RangeInclusive;
 use std::path::Path;
 
 /// Device name of the real controller (Steam's virtual pad has a different name).
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const CONTROLLER_NAME: &str = "Xbox Wireless Controller";
+
+/// Key codes of touch and tool contacts (`BTN_TOOL_PEN..=BTN_TOOL_QUADTAP`, including
+/// `BTN_TOUCH`), sent by touchpads, tablets and touchscreens on contact rather than a click.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const DIGITIZER_KEYS: RangeInclusive<u16> = 0x140..=0x14f;
+
+/// Whether a keyboard or mouse key event turns the TV on: a press (not a release or
+/// autorepeat) of a key or button other than a touch contact.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn is_press(code: u16, value: i32) -> bool {
+    value == 1 && !DIGITIZER_KEYS.contains(&code)
+}
 
 /// Count `eventN` entries under `class_input` (normally `/sys/class/input`) whose
 /// `device/name` is [`CONTROLLER_NAME`], skipping the one named `own`.
@@ -47,11 +61,11 @@ mod linux {
     use anyhow::{Context, Result};
     use evdev::{Device, EventSummary, InputEvent, KeyCode};
     use tokio::process::Command;
-    use tokio::time::{Instant, MissedTickBehavior, interval, sleep_until, timeout};
+    use tokio::time::{Instant, MissedTickBehavior, interval, sleep, sleep_until, timeout};
     use tracing::{error, info, warn};
 
     use super::machine::{Action, Event, Machine};
-    use super::{CONTROLLER_NAME, count_controllers_in};
+    use super::{CONTROLLER_NAME, count_controllers_in, is_press};
     use crate::config::Config;
     use crate::tv;
 
@@ -60,6 +74,12 @@ mod linux {
 
     /// Tick period while the machine waits for the wake delay.
     const TICK: Duration = Duration::from_millis(250);
+
+    /// How long to wait for access to the device when opening it.
+    const OPEN_RETRY: Duration = Duration::from_secs(30);
+
+    /// Minimum time between TV wakes from one keyboard or mouse.
+    const DESK_COOLDOWN: Duration = Duration::from_secs(30);
 
     const SYSFS_INPUT: &str = "/sys/class/input";
 
@@ -82,15 +102,96 @@ mod linux {
         Fatal(io::Error),
     }
 
-    /// Watch one controller's event device until it disappears, acting on the TV.
+    /// Watch one input device until it disappears, acting on the TV: the Xbox controller with
+    /// [`controller`], anything else (a keyboard or mouse, per the udev rule) with [`desk`].
     pub async fn run(cfg: &Config, device: &Path) -> Result<()> {
         let path = device.display().to_string();
-        let dev = Device::open(device).with_context(|| format!("opening {path}"))?;
+        let dev = open(device, &path).await?;
         let name = dev.name().unwrap_or_default().to_owned();
-        if name != CONTROLLER_NAME {
-            info!("{path}: name {name:?} is not {CONTROLLER_NAME:?}, ignoring");
-            return Ok(());
+        if name == CONTROLLER_NAME {
+            controller(cfg, device, dev, &name, &path).await
+        } else {
+            desk(cfg, dev, &name, &path).await
         }
+    }
+
+    /// Open the device, waiting up to [`OPEN_RETRY`] for access: the user's ACL on it may
+    /// only be added once the login session is active, after the unit started.
+    async fn open(device: &Path, path: &str) -> Result<Device> {
+        let start = Instant::now();
+        let mut logged = false;
+        loop {
+            match Device::open(device) {
+                Err(e)
+                    if e.kind() == io::ErrorKind::PermissionDenied
+                        && start.elapsed() < OPEN_RETRY =>
+                {
+                    if !logged {
+                        info!("{path}: no access yet, retrying for up to {OPEN_RETRY:?}");
+                        logged = true;
+                    }
+                    sleep(Duration::from_secs(1)).await;
+                }
+                res => return res.with_context(|| format!("opening {path}")),
+            }
+        }
+    }
+
+    /// Keyboard or mouse: a key press or click turns the TV on and switches to `input`, at most
+    /// once per [`DESK_COOLDOWN`], so typing doesn't contact the TV on every key.
+    async fn desk(cfg: &Config, dev: Device, name: &str, path: &str) -> Result<()> {
+        let mut events = dev
+            .into_event_stream()
+            .with_context(|| format!("reading {path}"))?;
+        let mut wake: Option<TvFuture<'_>> = None;
+        let mut last_wake: Option<Instant> = None;
+
+        info!("{name} ({path}): watching for key presses and clicks");
+
+        loop {
+            tokio::select! {
+                res = events.next_event() => match res {
+                    Ok(ev) => {
+                        if wake.is_none()
+                            && is_key_press(ev)
+                            && last_wake.is_none_or(|t| t.elapsed() >= DESK_COOLDOWN)
+                        {
+                            info!("{name} ({path}): key press, turning TV on");
+                            last_wake = Some(Instant::now());
+                            wake = Some(Box::pin(tv::on(cfg)));
+                        }
+                    }
+                    Err(e) if e.raw_os_error() == Some(ENODEV) => {
+                        info!("{name} ({path}): gone");
+                        break;
+                    }
+                    Err(e) => {
+                        error!("{name} ({path}): read error: {e}, exiting");
+                        break;
+                    }
+                },
+                res = async { wake.as_mut().expect("guarded by is_some").await }, if wake.is_some() => {
+                    wake = None;
+                    log_tv_result(name, path, "on", res);
+                }
+            }
+        }
+
+        if let Some(w) = wake.take() {
+            info!("{name} ({path}): waiting for the wake to finish");
+            log_tv_result(name, path, "on", w.await);
+        }
+        Ok(())
+    }
+
+    /// Controller: wake on connect, off on a long press of the Xbox button or idle-off.
+    async fn controller(
+        cfg: &Config,
+        device: &Path,
+        dev: Device,
+        name: &str,
+        path: &str,
+    ) -> Result<()> {
         // Resolve our own eventN now: once the device is gone, the node is too.
         let own = own_event_name(device);
 
@@ -140,7 +241,7 @@ mod linux {
                 Step::Skip => continue,
                 Step::WakeDone(res) => {
                     wake = None;
-                    log_tv_result(&name, &path, "on", res);
+                    log_tv_result(name, path, "on", res);
                     continue;
                 }
                 Step::Fatal(e) => {
@@ -167,12 +268,12 @@ mod linux {
                 Action::Off => {
                     // Let a wake still in flight finish first, so `off` doesn't race it.
                     if let Some(w) = wake.take() {
-                        log_tv_result(&name, &path, "on", w.await);
+                        log_tv_result(name, path, "on", w.await);
                     }
                     match other_controllers(own.as_deref()) {
                         0 => {
                             info!("{name} ({path}): off ({reason}), turning TV off");
-                            log_tv_result(&name, &path, "off", tv::off(cfg).await);
+                            log_tv_result(name, path, "off", tv::off(cfg).await);
                         }
                         n => info!(
                             "{name} ({path}): off ({reason}), but other controller connected ({n}), leaving TV on"
@@ -196,9 +297,16 @@ mod linux {
 
         if let Some(w) = wake.take() {
             info!("{name} ({path}): waiting for the wake to finish");
-            log_tv_result(&name, &path, "on", w.await);
+            log_tv_result(name, path, "on", w.await);
         }
         Ok(())
+    }
+
+    fn is_key_press(ev: InputEvent) -> bool {
+        match ev.destructure() {
+            EventSummary::Key(_, code, value) => is_press(code.code(), value),
+            _ => false,
+        }
     }
 
     /// Map an event to the machine's `btn_mode` field: `Some(Some(value))` for `BTN_MODE`,
@@ -351,6 +459,24 @@ mod tests {
             count_controllers_in(&t.0, Some(OsStr::new("event17"))).unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn presses() {
+        const KEY_A: u16 = 30;
+        const BTN_LEFT: u16 = 0x110;
+        const BTN_TOUCH: u16 = 0x14a;
+        assert!(is_press(KEY_A, 1));
+        assert!(is_press(BTN_LEFT, 1));
+        // Releases and autorepeat don't count.
+        assert!(!is_press(KEY_A, 0));
+        assert!(!is_press(KEY_A, 2));
+        assert!(!is_press(BTN_LEFT, 0));
+        // Touch contacts aren't clicks.
+        assert!(!is_press(BTN_TOUCH, 1));
+        assert!(!is_press(0x140, 1));
+        assert!(!is_press(0x14f, 1));
+        assert!(is_press(0x150, 1));
     }
 
     #[test]

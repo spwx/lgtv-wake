@@ -1,12 +1,12 @@
 # lgtv-wake
 
 Turns an LG webOS TV on and switches it to the gaming PC's input when an Xbox
-controller connects on Linux, and turns it off when the last controller is
-switched off with a long press of the Xbox button.
+controller connects on Linux, or a key or mouse button is pressed, and turns it
+off when the last controller is switched off with a long press of the Xbox button.
 
-udev starts one `lgtv-wake watch` process per connected controller, as a
-systemd user unit. The process watches the controller's buttons and exits
-when the controller disconnects. Nothing runs while no controller is connected.
+udev starts one `lgtv-wake watch` process per connected controller, keyboard and
+mouse, as a systemd user unit. The process watches the device's buttons and exits
+when the device disconnects.
 
 - **Wake:** a controller connects and either sends input or stays connected
   for `wake_delay_secs`. A controller waking up from idle and immediately
@@ -21,6 +21,13 @@ when the controller disconnects. Nothing runs while no controller is connected.
   ~42 minutes. In Desktop Mode, controllers are left alone. Set
   `idle_off_mins = 0` to turn this off. This uses `loginctl` (to read the
   session's desktop) and `bluetoothctl`.
+- **Keyboard and mouse:** a key press or mouse click (not movement or
+  scrolling) on a USB or Bluetooth keyboard or mouse, including ones with
+  their own dongle, turns the TV on and switches to `input`. Each device does
+  this at most every 30 seconds, and the TV is left alone if it's already on
+  `input`. Keyboards and mice never turn the TV off, and stay connected. The
+  udev rule gives the logged-in user read access to mice, as systemd already
+  does for keyboards.
 
 It's a single static binary with no runtime dependencies. The TV's TLS
 certificate is pinned (`certs/lg-c6.der`), and the config and client key live
@@ -44,13 +51,14 @@ rm lgtv-wake
    (or pass `--host`, `--mac`, `--broadcast`, `--input`);
 3. installs the user unit `~/.config/systemd/user/tv-controller@.service` and reloads systemd;
 4. installs the udev rule `/etc/udev/rules.d/90-lgtv-wake.rules` with `sudo`
+   and applies it to the keyboards and mice already connected
    (`--no-sudo` prints the commands instead);
 5. pairs with the TV if there's no client key yet (`--no-pair` skips it).
    The TV must be on: accept the prompt on screen.
 
 Both files are in [`deploy/`](deploy/) and are embedded in the binary.
 
-Then turn a controller on and watch the decisions:
+Then turn a controller on or press a key, and watch the decisions:
 
 ```sh
 journalctl -t lgtv-wake -f
@@ -64,7 +72,7 @@ journalctl -t lgtv-wake -f
 | `status` | Print the power state and current input; exits 1 if the TV doesn't answer |
 | `on` | Wake the TV (Wake-on-LAN, retried until `wake_timeout_secs`) and switch to `input` |
 | `off` | Turn the TV off, only if it's on `input` |
-| `watch <device>` | The per-controller loop that the udev rule starts (Linux only) |
+| `watch <device>` | The per-device loop that the udev rule starts (Linux only) |
 | `setup` | Install everything (Linux only) |
 | `update [--force]` | Download the latest release, check its SHA-256 and run its `setup` (Linux only) |
 

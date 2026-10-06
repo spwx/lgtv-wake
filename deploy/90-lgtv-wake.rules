@@ -1,3 +1,18 @@
 # Installed by `lgtv-wake setup` to /etc/udev/rules.d/.
 # Starts the user unit tv-controller@eventN.service when an Xbox controller connects.
 ACTION=="add", SUBSYSTEM=="input", KERNEL=="event[0-9]*", ATTRS{name}=="Xbox Wireless Controller", TAG+="systemd", ENV{SYSTEMD_USER_WANTS}+="tv-controller@%k.service"
+
+# And for each USB or Bluetooth keyboard and mouse (not virtual devices like Steam's), to turn
+# the TV on with a key press or click. Mice aren't readable by the logged-in user by default,
+# so grant it access as for keyboards (uaccess). Not just on "add", so a "change" event keeps
+# the tags, and `udevadm trigger --action=change` picks up devices already connected.
+ACTION=="remove", GOTO="lgtv_wake_end"
+SUBSYSTEM!="input", GOTO="lgtv_wake_end"
+KERNEL!="event[0-9]*", GOTO="lgtv_wake_end"
+ENV{ID_BUS}!="usb|bluetooth", GOTO="lgtv_wake_end"
+ENV{ID_INPUT_KEYBOARD}=="1", GOTO="lgtv_wake_desk"
+ENV{ID_INPUT_MOUSE}=="1", GOTO="lgtv_wake_desk"
+GOTO="lgtv_wake_end"
+LABEL="lgtv_wake_desk"
+TAG+="uaccess", RUN{builtin}+="uaccess", TAG+="systemd", ENV{SYSTEMD_USER_WANTS}+="tv-controller@%k.service"
+LABEL="lgtv_wake_end"

@@ -102,6 +102,18 @@ pub async fn on(cfg: &Config) -> Result<()> {
             }
             Err(e) => warn!("could not read the power state after wake: {e:#}"),
         }
+    } else {
+        // Skip the switch when it's already on the input: keyboard and mouse wakes repeat
+        // this while the TV is in use.
+        match client.request(FOREGROUND_APP, json!({})).await {
+            Ok(app) if app_id(&app) == input_app_id(&cfg.input) => {
+                info!("already on {}", cfg.input);
+                client.close().await;
+                return Ok(());
+            }
+            Ok(_) => {}
+            Err(e) => warn!("could not read the current input: {e:#}"),
+        }
     }
 
     client

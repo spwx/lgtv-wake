@@ -63,7 +63,7 @@ pub async fn run(opts: &Options) -> Result<()> {
     }
 
     println!(
-        "\nDone. Turn a controller on, then follow the logs with:\n  journalctl -t lgtv-wake -f"
+        "\nDone. Turn a controller on or press a key, then follow the logs with:\n  journalctl -t lgtv-wake -f"
     );
     Ok(())
 }
@@ -234,18 +234,29 @@ fn install_rule(no_sudo: bool) -> Result<()> {
     let tmp = tmp.to_str().context("temp path is not UTF-8")?;
     let install = ["install", "-m", "0644", tmp, RULE_PATH];
     let reload = ["udevadm", "control", "--reload"];
+    // Apply the rule to keyboards and mice already connected; controllers start on connect.
+    let trigger = [
+        "udevadm",
+        "trigger",
+        "--action=change",
+        "--subsystem-match=input",
+        "--property-match=ID_INPUT_KEYBOARD=1",
+        "--property-match=ID_INPUT_MOUSE=1",
+    ];
 
     if no_sudo {
         println!(
-            "udev rule: run these to install it:\n  sudo {}\n  sudo {}",
+            "udev rule: run these to install it:\n  sudo {}\n  sudo {}\n  sudo {}",
             install.join(" "),
-            reload.join(" ")
+            reload.join(" "),
+            trigger.join(" ")
         );
         return Ok(());
     }
     println!("udev rule: installing {RULE_PATH} (sudo may ask for your password)");
     run_cmd("sudo", &install)?;
     run_cmd("sudo", &reload)?;
+    run_cmd("sudo", &trigger)?;
     let _ = fs::remove_file(tmp);
     Ok(())
 }
@@ -320,5 +331,6 @@ docker0\t000011AC\t00000000\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0
     fn embedded_files() {
         assert!(UNIT.contains("ExecStart=%h/.local/bin/lgtv-wake watch /dev/input/%i"));
         assert!(RULE.contains("SYSTEMD_USER_WANTS}+=\"tv-controller@%k.service\""));
+        assert!(RULE.contains("LABEL=\"lgtv_wake_desk\""));
     }
 }
