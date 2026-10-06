@@ -92,8 +92,12 @@ pub async fn on(cfg: &Config) -> Result<()> {
         match client.request(POWER_STATE, json!({})).await {
             Ok(p) => {
                 let state = power_state(&p);
+                // Seen: "Suspend" right after a wake, then "Active" ~3s later; the
+                // input switch works either way.
                 if state != "Active" {
-                    warn!("TV power state after wake is {state:?}, not \"Active\"");
+                    info!(
+                        "TV power state after wake is {state:?} (usually becomes \"Active\" within seconds)"
+                    );
                 }
             }
             Err(e) => warn!("could not read the power state after wake: {e:#}"),

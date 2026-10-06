@@ -1,7 +1,7 @@
 //! SSAP over `wss://<host>:3001`: connect, register (with/without key), request/response by id.
 //!
-//! Message formats follow `lg-webos-client` (its `handshake.json`, the standard signed
-//! manifest also used by lgtv2/pywebostv) and alga:
+//! Message formats follow `lg-webos-client` and alga. The manifest is unsigned, as in
+//! alga: this TV blacklists the signed one from lg-webos-client/lgtv2/pywebostv.
 //!
 //! - register: `{"type":"register","id":"register_0","payload":{"pairingType":"PROMPT","manifest":{...},"client-key":"..."}}`
 //! - prompt shown: `{"type":"response","id":"register_0","payload":{"pairingType":"PROMPT","returnValue":true}}`
@@ -212,7 +212,7 @@ pub fn is_unreachable(err: &anyhow::Error) -> bool {
     })
 }
 
-/// Build the `register` message with the standard signed manifest.
+/// Build the `register` message with an unsigned manifest.
 pub fn register_message(id: &str, client_key: Option<&str>) -> Value {
     let mut payload = json!({
         "forcePairing": false,
@@ -326,45 +326,14 @@ fn error_text(payload: &Value) -> Option<String> {
     })
 }
 
-/// The standard signed manifest (from LG's own remote app, as used by
-/// lg-webos-client, lgtv2, pywebostv). The signature covers `signed`; the
-/// unsigned `permissions` include everything `lgtv-wake` needs.
+/// An unsigned manifest, as alga sends. Recent webOS firmware rejects the old signed
+/// manifest from LG's remote app (lg-webos-client, lgtv2, pywebostv) with `403 Pairing
+/// rejected: blacklisted certificate detected`. The permissions cover everything
+/// `lgtv-wake` needs.
 fn manifest() -> Value {
     json!({
         "manifestVersion": 1,
         "appVersion": "1.1",
-        "signed": {
-            "created": "20140509",
-            "appId": "com.lge.test",
-            "vendorId": "com.lge",
-            "localizedAppNames": {
-                "": "LG Remote App",
-                "ko-KR": "리모컨 앱",
-                "zxx-XX": "ЛГ Rэмotэ AПП"
-            },
-            "localizedVendorNames": {
-                "": "LG Electronics"
-            },
-            "permissions": [
-                "TEST_SECURE",
-                "CONTROL_INPUT_TEXT",
-                "CONTROL_MOUSE_AND_KEYBOARD",
-                "READ_INSTALLED_APPS",
-                "READ_LGE_SDX",
-                "READ_NOTIFICATIONS",
-                "SEARCH",
-                "WRITE_SETTINGS",
-                "WRITE_NOTIFICATION_ALERT",
-                "CONTROL_POWER",
-                "READ_CURRENT_CHANNEL",
-                "READ_RUNNING_APPS",
-                "READ_UPDATE_INFO",
-                "UPDATE_FROM_REMOTE_APP",
-                "READ_LGE_TV_INPUT_EVENTS",
-                "READ_TV_CURRENT_TIME"
-            ],
-            "serial": "2f930e2d2cfe083771f68e4fe7bb07"
-        },
         "permissions": [
             "LAUNCH",
             "LAUNCH_WEBAPP",
@@ -388,12 +357,6 @@ fn manifest() -> Value {
             "WRITE_NOTIFICATION_TOAST",
             "READ_POWER_STATE",
             "READ_COUNTRY_INFO"
-        ],
-        "signatures": [
-            {
-                "signatureVersion": 1,
-                "signature": "eyJhbGdvcml0aG0iOiJSU0EtU0hBMjU2Iiwia2V5SWQiOiJ0ZXN0LXNpZ25pbmctY2VydCIsInNpZ25hdHVyZVZlcnNpb24iOjF9.hrVRgjCwXVvE2OOSpDZ58hR+59aFNwYDyjQgKk3auukd7pcegmE2CzPCa0bJ0ZsRAcKkCTJrWo5iDzNhMBWRyaMOv5zWSrthlf7G128qvIlpMT0YNY+n/FaOHE73uLrS/g7swl3/qH/BGFG2Hu4RlL48eb3lLKqTt2xKHdCs6Cd4RMfJPYnzgvI4BNrFUKsjkcu+WD4OO2A27Pq1n50cMchmcaXadJhGrOqH5YmHdOCj5NSHzJYrsW0HPlpuAx/ECMeIZYDh6RMqaFM2DXzdKX9NmmyqzJ3o/0lkk/N97gfVRLW5hA29yeAwaCViZNCP8iC9aO0q9fQojoa7NQnAtw=="
-            }
         ]
     })
 }
@@ -412,8 +375,8 @@ mod tests {
         assert!(m["payload"].get("client-key").is_none());
         let manifest = &m["payload"]["manifest"];
         assert_eq!(manifest["manifestVersion"], 1);
-        assert_eq!(manifest["signed"]["appId"], "com.lge.test");
-        assert_eq!(manifest["signatures"][0]["signatureVersion"], 1);
+        assert!(manifest.get("signed").is_none());
+        assert!(manifest.get("signatures").is_none());
         let perms: Vec<&str> = manifest["permissions"]
             .as_array()
             .unwrap()
