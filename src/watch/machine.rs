@@ -1,4 +1,4 @@
-//! Pure state machine for the watcher: wake-delay and long-press decisions. No I/O.
+//! Pure state machine for the watcher: wake-delay, long-press and idle-off decisions. No I/O.
 #![allow(dead_code)]
 
 use std::fmt;
@@ -17,6 +17,9 @@ pub enum Event {
     Input { t: Time, btn_mode: Option<i32> },
     /// Periodic tick while waiting for the wake delay.
     Tick { t: Time },
+    /// The idle deadline ([`Machine::idle_deadline`]) passed; `game_mode` is whether the
+    /// session is in Game Mode (idle-off only applies there).
+    Idle { t: Time, game_mode: bool },
     /// The device is gone (ENODEV).
     Gone { t: Time },
 }
@@ -27,6 +30,8 @@ pub enum Action {
     Wake,
     Off,
     Exit,
+    /// Disconnect the controller (idle-off); its `Gone` then returns `Off`.
+    Disconnect,
 }
 
 /// Why the machine returned its last non-`None` action, for logging.
@@ -56,6 +61,10 @@ pub enum Reason {
     },
     /// `Exit`: gone with no `BTN_MODE` press seen.
     NoButtonHeld,
+    /// `Disconnect`: no input for `idle`, in Game Mode.
+    IdleTimeout { idle: Duration },
+    /// `Off`: gone after the idle-off disconnect.
+    IdleOff { idle: Duration },
 }
 
 impl fmt::Display for Reason {
@@ -81,6 +90,8 @@ impl fmt::Display for Reason {
                 write!(f, "press {} released {} ago", Dur(held), Dur(before_gone))
             }
             Reason::NoButtonHeld => write!(f, "no button held"),
+            Reason::IdleTimeout { idle } => write!(f, "idle {}", Dur(idle)),
+            Reason::IdleOff { idle } => write!(f, "idle-off after {}", Dur(idle)),
         }
     }
 }
@@ -120,6 +131,12 @@ pub struct Machine {
     start: Time,
     wake_delay: Duration,
     long_press: Duration,
+    /// Disconnect after this long without input (in Game Mode); `None` disables idle-off.
+    idle_off: Option<Duration>,
+    /// Time of the last input (or `start`), or when the idle clock was last restarted.
+    idle_since: Time,
+    /// Set when `Disconnect` was returned: how long the controller had been idle.
+    disconnecting: Option<Duration>,
     /// Time of the last `BTN_MODE` press.
     pressed_at: Option<Time>,
     /// Time of the release following `pressed_at`, if any.
@@ -129,12 +146,20 @@ pub struct Machine {
 
 impl Machine {
     /// New machine for a device that appeared at `start`.
-    pub fn new(start: Time, wake_delay: Duration, long_press: Duration) -> Self {
+    pub fn new(
+        start: Time,
+        wake_delay: Duration,
+        long_press: Duration,
+        idle_off: Option<Duration>,
+    ) -> Self {
         Self {
             state: State::Pending,
             start,
             wake_delay,
             long_press,
+            idle_off,
+            idle_since: start,
+            disconnecting: None,
             pressed_at: None,
             released_at: None,
             reason: None,
@@ -171,17 +196,51 @@ impl Machine {
                 Action::None
             }
             (State::Running, Event::Tick { .. }) => Action::None,
+            (State::Running, Event::Idle { t, game_mode }) => {
+                let Some(idle_off) = self.idle_off else {
+                    return Action::None;
+                };
+                let idle = t.saturating_sub(self.idle_since);
+                if self.disconnecting.is_some() || idle < idle_off {
+                    Action::None
+                } else if game_mode {
+                    self.disconnecting = Some(idle);
+                    self.decide(Action::Disconnect, Reason::IdleTimeout { idle })
+                } else {
+                    // Not in Game Mode: start the idle clock over and check again later.
+                    self.idle_since = t;
+                    Action::None
+                }
+            }
             (State::Running, Event::Gone { t }) => {
                 self.state = State::Done;
-                let (action, reason) = self.on_gone(t);
+                let (action, reason) = match self.disconnecting {
+                    Some(idle) => (Action::Off, Reason::IdleOff { idle }),
+                    None => self.on_gone(t),
+                };
                 self.decide(action, reason)
             }
+            (State::Pending, Event::Idle { .. }) => Action::None,
         }
     }
 
     /// Whether the I/O layer still needs to send `Tick`s (only while waiting for the wake delay).
     pub fn needs_tick(&self) -> bool {
         self.state == State::Pending
+    }
+
+    /// When to send the next `Idle` event, if idle-off is enabled and not already disconnecting.
+    pub fn idle_deadline(&self) -> Option<Time> {
+        match (self.state, self.idle_off, self.disconnecting) {
+            (State::Running, Some(idle_off), None) => Some(self.idle_since + idle_off),
+            _ => None,
+        }
+    }
+
+    /// The `Disconnect` failed: start the idle clock over at `t`, so it's retried later.
+    pub fn disconnect_failed(&mut self, t: Time) {
+        self.disconnecting = None;
+        self.idle_since = t;
     }
 
     /// Whether the machine has returned its final action (`Exit` or `Off`).
@@ -200,6 +259,9 @@ impl Machine {
     }
 
     fn track(&mut self, t: Time, btn_mode: Option<i32>) {
+        self.idle_since = t;
+        // Input before the disconnect lands: someone's using it, so a `Gone` now isn't idle.
+        self.disconnecting = None;
         match btn_mode {
             Some(1) => {
                 self.pressed_at = Some(t);
@@ -245,13 +307,14 @@ mod tests {
 
     const WAKE: Duration = Duration::from_secs(5);
     const LONG: Duration = Duration::from_secs(5);
+    const IDLE: Duration = Duration::from_secs(900);
 
     fn ms(n: u64) -> Time {
         Duration::from_millis(n)
     }
 
     fn machine() -> Machine {
-        Machine::new(ms(1_000), WAKE, LONG)
+        Machine::new(ms(1_000), WAKE, LONG, Some(IDLE))
     }
 
     fn input(t: u64) -> Event {
@@ -502,6 +565,94 @@ mod tests {
         assert_eq!(m.step(gone(20_001)), Action::None);
     }
 
+    fn idle(t: u64, game_mode: bool) -> Event {
+        Event::Idle {
+            t: ms(t),
+            game_mode,
+        }
+    }
+
+    #[test]
+    fn idle_deadline_follows_last_input() {
+        let mut m = machine();
+        assert_eq!(m.idle_deadline(), None); // not before waking
+        assert_eq!(m.step(input(2_000)), Action::Wake);
+        assert_eq!(m.idle_deadline(), Some(ms(2_000) + IDLE));
+        assert_eq!(m.step(input(60_000)), Action::None);
+        assert_eq!(m.idle_deadline(), Some(ms(60_000) + IDLE));
+    }
+
+    #[test]
+    fn idle_deadline_from_start_when_woken_without_input() {
+        assert_eq!(running().idle_deadline(), Some(ms(1_000) + IDLE));
+    }
+
+    #[test]
+    fn idle_in_game_mode_disconnects_then_gone_is_off() {
+        let mut m = running();
+        assert_eq!(m.step(input(10_000)), Action::None);
+        assert_eq!(m.step(idle(910_000, true)), Action::Disconnect);
+        assert_eq!(m.reason(), Some(Reason::IdleTimeout { idle: IDLE }));
+        assert_eq!(m.idle_deadline(), None);
+        // A late `Idle` doesn't disconnect twice.
+        assert_eq!(m.step(idle(911_000, true)), Action::None);
+        assert_eq!(m.step(gone(910_400)), Action::Off);
+        assert_eq!(m.reason(), Some(Reason::IdleOff { idle: IDLE }));
+        assert!(m.is_done());
+    }
+
+    #[test]
+    fn early_idle_event_does_nothing() {
+        let mut m = running();
+        assert_eq!(m.step(idle(500_000, true)), Action::None);
+        assert_eq!(m.idle_deadline(), Some(ms(1_000) + IDLE));
+    }
+
+    #[test]
+    fn idle_outside_game_mode_restarts_the_clock() {
+        let mut m = running();
+        assert_eq!(m.step(idle(901_000, false)), Action::None);
+        assert_eq!(m.idle_deadline(), Some(ms(901_000) + IDLE));
+        // A later idle-off in Game Mode measures from the restart.
+        assert_eq!(m.step(idle(1_801_000, true)), Action::Disconnect);
+        assert_eq!(m.reason(), Some(Reason::IdleTimeout { idle: IDLE }));
+    }
+
+    #[test]
+    fn idle_firmware_drop_outside_game_mode_exits() {
+        let mut m = running();
+        assert_eq!(m.step(idle(901_000, false)), Action::None);
+        assert_eq!(m.step(gone(2_521_000)), Action::Exit);
+        assert_eq!(m.reason(), Some(Reason::NoButtonHeld));
+    }
+
+    #[test]
+    fn input_after_disconnect_cancels_idle_off() {
+        let mut m = running();
+        assert_eq!(m.step(idle(901_000, true)), Action::Disconnect);
+        assert_eq!(m.step(input(901_200)), Action::None);
+        assert_eq!(m.idle_deadline(), Some(ms(901_200) + IDLE));
+        assert_eq!(m.step(gone(901_300)), Action::Exit);
+        assert_eq!(m.reason(), Some(Reason::NoButtonHeld));
+    }
+
+    #[test]
+    fn failed_disconnect_retries_after_another_idle_period() {
+        let mut m = running();
+        assert_eq!(m.step(idle(901_000, true)), Action::Disconnect);
+        m.disconnect_failed(ms(902_000));
+        assert_eq!(m.idle_deadline(), Some(ms(902_000) + IDLE));
+        assert_eq!(m.step(idle(1_802_000, true)), Action::Disconnect);
+    }
+
+    #[test]
+    fn idle_off_disabled() {
+        let mut m = Machine::new(ms(1_000), WAKE, LONG, None);
+        assert_eq!(m.step(input(2_000)), Action::Wake);
+        assert_eq!(m.idle_deadline(), None);
+        assert_eq!(m.step(idle(10_000_000, true)), Action::None);
+    }
+
     #[test]
     fn reason_display() {
         assert_eq!(
@@ -523,6 +674,11 @@ mod tests {
             }
             .to_string(),
             "still connected after 1h2m"
+        );
+        assert_eq!(Reason::IdleTimeout { idle: IDLE }.to_string(), "idle 15m");
+        assert_eq!(
+            Reason::IdleOff { idle: IDLE }.to_string(),
+            "idle-off after 15m"
         );
     }
 }

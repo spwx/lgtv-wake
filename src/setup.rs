@@ -200,6 +200,7 @@ input = "{input}"
 # wake_delay_secs = 5
 # long_press_secs = 5
 # wake_timeout_secs = 20
+# idle_off_mins = 15   # Game Mode only; 0 disables
 # tls = "insecure"   # accept any certificate from `host` (if the pinned one changed)
 "#
     )

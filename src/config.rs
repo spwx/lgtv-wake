@@ -18,6 +18,7 @@ input = "HDMI_1"
 wake_delay_secs = 5
 long_press_secs = 5
 wake_timeout_secs = 20
+idle_off_mins = 15   # Game Mode only; 0 disables
 # tls = "insecure"   # accept any certificate from `host` (if the pinned one changed)
 "#;
 
@@ -53,6 +54,9 @@ pub struct Config {
     pub long_press_secs: u64,
     #[serde(default = "default_wake_timeout")]
     pub wake_timeout_secs: u64,
+    /// Disconnect a controller idle this long in Game Mode (0 disables).
+    #[serde(default = "default_idle_off")]
+    pub idle_off_mins: u64,
     #[serde(default)]
     pub tls: TlsMode,
 }
@@ -65,6 +69,9 @@ fn default_long_press() -> u64 {
 }
 fn default_wake_timeout() -> u64 {
     20
+}
+fn default_idle_off() -> u64 {
+    15
 }
 
 impl Config {
@@ -101,6 +108,12 @@ impl Config {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))] // used by `watch`
     pub fn long_press(&self) -> Duration {
         Duration::from_secs(self.long_press_secs)
+    }
+
+    /// `None` when `idle_off_mins` is 0.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))] // used by `watch`
+    pub fn idle_off(&self) -> Option<Duration> {
+        (self.idle_off_mins > 0).then(|| Duration::from_secs(self.idle_off_mins * 60))
     }
 
     pub fn wake_timeout(&self) -> Duration {
@@ -222,6 +235,7 @@ input = "HDMI_1"
         assert_eq!(c.wake_delay_secs, 5);
         assert_eq!(c.long_press_secs, 5);
         assert_eq!(c.wake_timeout_secs, 20);
+        assert_eq!(c.idle_off(), Some(Duration::from_secs(900)));
         assert_eq!(c.tls, TlsMode::Pinned);
     }
 
@@ -240,12 +254,13 @@ input = "HDMI_1"
     #[test]
     fn overrides_and_insecure_tls() {
         let text = format!(
-            "{MINIMAL}wake_delay_secs = 7\nlong_press_secs = 3\nwake_timeout_secs = 30\ntls = \"insecure\"\n"
+            "{MINIMAL}wake_delay_secs = 7\nlong_press_secs = 3\nwake_timeout_secs = 30\nidle_off_mins = 0\ntls = \"insecure\"\n"
         );
         let c = Config::parse(&text).unwrap();
         assert_eq!(c.wake_delay(), Duration::from_secs(7));
         assert_eq!(c.long_press(), Duration::from_secs(3));
         assert_eq!(c.wake_timeout(), Duration::from_secs(30));
+        assert_eq!(c.idle_off(), None);
         assert_eq!(c.tls, TlsMode::Insecure);
     }
 

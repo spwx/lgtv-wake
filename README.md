@@ -14,6 +14,13 @@ when the controller disconnects. Nothing runs while no controller is connected.
 - **Off:** the controller disconnects after the Xbox button was held for
   `long_press_secs`, no other controller is connected, and the TV is still on
   the configured input. If the TV is on something else, it's left alone.
+- **Idle off:** in Game Mode, a controller with no input for `idle_off_mins`
+  is disconnected over Bluetooth, which powers it off, and the TV turns off
+  under the same conditions as a long press. Steam's own idle setting can't
+  power off an Xbox controller over Bluetooth, which otherwise stays on for
+  ~42 minutes. In Desktop Mode, controllers are left alone. Set
+  `idle_off_mins = 0` to turn this off. This uses `loginctl` (to read the
+  session's desktop) and `bluetoothctl`.
 
 It's a single static binary with no runtime dependencies. The TV's TLS
 certificate is pinned (`certs/lg-c6.der`), and the config and client key live
@@ -76,6 +83,7 @@ input = "HDMI_1"
 # wake_delay_secs = 5
 # long_press_secs = 5
 # wake_timeout_secs = 20
+# idle_off_mins = 15
 # tls = "insecure"
 ```
 

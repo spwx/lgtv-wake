@@ -41,11 +41,13 @@ mod linux {
     use std::io;
     use std::path::Path;
     use std::pin::Pin;
-    use std::time::{Duration, Instant};
+    use std::process::Output;
+    use std::time::Duration;
 
     use anyhow::{Context, Result};
     use evdev::{Device, EventSummary, InputEvent, KeyCode};
-    use tokio::time::{MissedTickBehavior, interval};
+    use tokio::process::Command;
+    use tokio::time::{Instant, MissedTickBehavior, interval, sleep_until, timeout};
     use tracing::{error, info, warn};
 
     use super::machine::{Action, Event, Machine};
@@ -60,6 +62,12 @@ mod linux {
     const TICK: Duration = Duration::from_millis(250);
 
     const SYSFS_INPUT: &str = "/sys/class/input";
+
+    /// logind's `Desktop` for the Steam Game Mode session.
+    const GAME_MODE_DESKTOP: &str = "gamescope";
+
+    /// Limit for each `loginctl`/`bluetoothctl` call.
+    const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
     type TvFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + 'a>>;
 
@@ -88,7 +96,9 @@ mod linux {
 
         let origin = Instant::now();
         let now = || origin.elapsed();
-        let mut machine = Machine::new(now(), cfg.wake_delay(), cfg.long_press());
+        let mut machine = Machine::new(now(), cfg.wake_delay(), cfg.long_press(), cfg.idle_off());
+        // Bluetooth address, for the idle-off disconnect.
+        let mac = dev.unique_name().unwrap_or_default().to_owned();
         let mut events = dev
             .into_event_stream()
             .with_context(|| format!("reading {path}"))?;
@@ -111,6 +121,15 @@ mod linux {
                     Err(e) => Step::Fatal(e),
                 },
                 _ = ticker.tick(), if machine.needs_tick() => Step::Event(Event::Tick { t: now() }),
+                _ = sleep_until(origin + machine.idle_deadline().unwrap_or_default()),
+                    if machine.idle_deadline().is_some() =>
+                {
+                    let game_mode = game_mode().await;
+                    if !game_mode {
+                        info!("{name} ({path}): idle, but not in Game Mode, leaving it connected");
+                    }
+                    Step::Event(Event::Idle { t: now(), game_mode })
+                }
                 res = async { wake.as_mut().expect("guarded by is_some").await }, if wake.is_some() => {
                     Step::WakeDone(res)
                 }
@@ -161,6 +180,13 @@ mod linux {
                     }
                 }
                 Action::Exit => info!("{name} ({path}): exit ({reason}), no TV action"),
+                Action::Disconnect => {
+                    info!("{name} ({path}): {reason}, disconnecting {mac}");
+                    if let Err(e) = disconnect(&mac).await {
+                        error!("{name} ({path}): disconnecting {mac}: {e:#}");
+                        machine.disconnect_failed(now());
+                    }
+                }
             }
 
             if machine.is_done() {
@@ -185,6 +211,49 @@ mod linux {
             EventSummary::Key(_, KeyCode::BTN_MODE, value) => Some(Some(value)),
             _ => Some(None),
         }
+    }
+
+    /// Whether the user's display session is Steam's Game Mode. Errors count as no, so the TV
+    /// is never turned off on a guess.
+    async fn game_mode() -> bool {
+        match command(
+            "loginctl",
+            &["show-session", "auto", "-p", "Desktop", "--value"],
+        )
+        .await
+        {
+            Ok(out) => String::from_utf8_lossy(&out.stdout).trim() == GAME_MODE_DESKTOP,
+            Err(e) => {
+                warn!("checking for Game Mode: {e:#}, assuming not");
+                false
+            }
+        }
+    }
+
+    /// Disconnect the controller over Bluetooth, which powers it off.
+    async fn disconnect(mac: &str) -> Result<()> {
+        anyhow::ensure!(!mac.is_empty(), "the device has no Bluetooth address");
+        command("bluetoothctl", &["disconnect", mac])
+            .await
+            .map(drop)
+    }
+
+    /// Run `program` with `args`, failing on a non-zero exit or after [`COMMAND_TIMEOUT`].
+    async fn command(program: &str, args: &[&str]) -> Result<Output> {
+        let out = timeout(
+            COMMAND_TIMEOUT,
+            Command::new(program).args(args).kill_on_drop(true).output(),
+        )
+        .await
+        .with_context(|| format!("{program} timed out"))?
+        .with_context(|| format!("running {program}"))?;
+        anyhow::ensure!(
+            out.status.success(),
+            "{program} failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        Ok(out)
     }
 
     /// `eventN` for our device (resolving symlinks like `/dev/input/by-id/...`).
