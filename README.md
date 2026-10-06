@@ -46,7 +46,7 @@ Both files are in [`deploy/`](deploy/) and are embedded in the binary.
 Then turn a controller on and watch the decisions:
 
 ```sh
-journalctl --user -u 'tv-controller@*' -f
+journalctl -t lgtv-wake -f
 ```
 
 ## Commands

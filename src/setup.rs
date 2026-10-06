@@ -63,7 +63,7 @@ pub async fn run(opts: &Options) -> Result<()> {
     }
 
     println!(
-        "\nDone. Turn a controller on, then follow the logs with:\n  journalctl --user -u 'tv-controller@*' -f"
+        "\nDone. Turn a controller on, then follow the logs with:\n  journalctl -t lgtv-wake -f"
     );
     Ok(())
 }
