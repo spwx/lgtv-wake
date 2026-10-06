@@ -1,0 +1,3 @@
+# Installed by `lgtv-wake setup` to /etc/udev/rules.d/.
+# Starts the user unit tv-controller@eventN.service when an Xbox controller connects.
+ACTION=="add", SUBSYSTEM=="input", KERNEL=="event[0-9]*", ATTRS{name}=="Xbox Wireless Controller", TAG+="systemd", ENV{SYSTEMD_USER_WANTS}+="tv-controller@%k.service"

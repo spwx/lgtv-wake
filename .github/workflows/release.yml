@@ -1,0 +1,45 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      TARGET: x86_64-unknown-linux-musl
+      ASSET: lgtv-wake-x86_64-linux-musl
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      # ring compiles C code; musl-gcc provides the compiler for the musl target.
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Check the tag matches Cargo.toml
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $version" >&2
+            exit 1
+          fi
+
+      - run: cargo test
+      - run: cargo build --release --locked --target "$TARGET"
+
+      - name: Package
+        run: |
+          cp "target/$TARGET/release/lgtv-wake" "$ASSET"
+          file "$ASSET" | tee /dev/stderr | grep -Eq 'statically linked|static-pie linked'
+          sha256sum "$ASSET" > "$ASSET.sha256"
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" "$ASSET" "$ASSET.sha256" --generate-notes

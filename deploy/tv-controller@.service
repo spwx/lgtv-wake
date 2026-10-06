@@ -1,0 +1,9 @@
+# Installed by `lgtv-wake setup` to ~/.config/systemd/user/.
+# Started by the udev rule (90-lgtv-wake.rules) for each controller event
+# device; the process exits on its own when the controller disconnects.
+[Unit]
+Description=LG TV wake for controller %i
+
+[Service]
+ExecStart=%h/.local/bin/lgtv-wake watch /dev/input/%i
+Restart=no
