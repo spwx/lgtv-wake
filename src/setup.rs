@@ -70,9 +70,7 @@ pub async fn run(opts: &Options) -> Result<()> {
 
 /// Copy the running binary to `~/.local/bin/lgtv-wake`.
 fn install_binary() -> Result<()> {
-    let target = dirs::home_dir()
-        .context("could not determine the home directory")?
-        .join(".local/bin/lgtv-wake");
+    let target = installed_path()?;
     let current = std::env::current_exe().context("could not find the running binary")?;
     if fs::canonicalize(&current).ok() == fs::canonicalize(&target).ok() {
         println!("binary: already running from {}", target.display());
@@ -87,6 +85,13 @@ fn install_binary() -> Result<()> {
     fs::rename(&tmp, &target).with_context(|| format!("installing {}", target.display()))?;
     println!("binary: installed {}", target.display());
     Ok(())
+}
+
+/// Where `setup` installs the binary: `~/.local/bin/lgtv-wake`.
+pub fn installed_path() -> Result<PathBuf> {
+    Ok(dirs::home_dir()
+        .context("could not determine the home directory")?
+        .join(".local/bin/lgtv-wake"))
 }
 
 /// Keep an existing config (after checking it parses), or write a new one
@@ -248,7 +253,7 @@ fn staged_rule_path() -> PathBuf {
     std::env::temp_dir().join("90-lgtv-wake.rules")
 }
 
-fn run_cmd(program: &str, args: &[&str]) -> Result<()> {
+pub fn run_cmd(program: &str, args: &[&str]) -> Result<()> {
     let status = Command::new(program)
         .args(args)
         .status()

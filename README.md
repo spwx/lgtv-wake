@@ -30,7 +30,7 @@ chmod +x lgtv-wake
 rm lgtv-wake
 ```
 
-`setup` is safe to run again (for example to upgrade). It:
+`setup` is safe to run again. To upgrade later, run `lgtv-wake update`. `setup` does the following:
 
 1. copies itself to `~/.local/bin/lgtv-wake`;
 2. writes `~/.config/lgtv-wake/config.toml` if it doesn't exist, asking for the TV's IP and MAC address
@@ -59,6 +59,7 @@ journalctl -t lgtv-wake -f
 | `off` | Turn the TV off, only if it's on `input` |
 | `watch <device>` | The per-controller loop that the udev rule starts (Linux only) |
 | `setup` | Install everything (Linux only) |
+| `update [--force]` | Download the latest release, check its SHA-256 and run its `setup` (Linux only) |
 
 `pair`, `status`, `on` and `off` also work on macOS, with the config in
 `~/.config/lgtv-wake/` there too. Each machine needs its own client key.

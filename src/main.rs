@@ -4,6 +4,7 @@ mod setup;
 mod ssap;
 mod tls;
 mod tv;
+mod update;
 mod watch;
 mod wol;
 
@@ -40,6 +41,8 @@ enum Command {
     Status,
     /// Install the binary, config, systemd user unit and udev rule, then pair (Linux only)
     Setup(setup::Options),
+    /// Download the latest release and run its setup (Linux only)
+    Update(update::Options),
     /// Watch a controller's event device and drive the TV (Linux only)
     Watch {
         /// Event device, e.g. /dev/input/event17
@@ -78,6 +81,9 @@ async fn run() -> Result<()> {
     if let Command::Setup(opts) = &cli.command {
         return setup::run(opts).await;
     }
+    if let Command::Update(opts) = &cli.command {
+        return update::run(opts);
+    }
 
     let cfg = Config::load()?;
 
@@ -86,7 +92,7 @@ async fn run() -> Result<()> {
         Command::On => tv::on(&cfg).await,
         Command::Off => tv::off(&cfg).await,
         Command::Status => tv::status(&cfg).await,
-        Command::Setup(_) => unreachable!(),
+        Command::Setup(_) | Command::Update(_) => unreachable!(),
         #[cfg(target_os = "linux")]
         Command::Watch { device } => watch::run(&cfg, &device).await,
         #[cfg(not(target_os = "linux"))]
