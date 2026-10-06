@@ -152,10 +152,37 @@ fn value(flag: Option<String>, name: &str, label: &str, default: Option<String>)
     }
 }
 
-/// `a.b.c.255` for an IPv4 host (assumes a /24).
+/// The broadcast address of the local subnet containing `host`, from
+/// `/proc/net/route`; `a.b.c.255` (a /24) if no route matches.
 fn default_broadcast(host: &str) -> Option<Ipv4Addr> {
-    let [a, b, c, _] = host.parse::<Ipv4Addr>().ok()?.octets();
-    Some(Ipv4Addr::new(a, b, c, 255))
+    let host = host.parse::<Ipv4Addr>().ok()?;
+    let routes = fs::read_to_string("/proc/net/route").unwrap_or_default();
+    broadcast_from_routes(host, &routes).or_else(|| {
+        let [a, b, c, _] = host.octets();
+        Some(Ipv4Addr::new(a, b, c, 255))
+    })
+}
+
+/// Find the most specific on-link route (no gateway) in `/proc/net/route`
+/// text that contains `host`, and return its subnet's broadcast address.
+fn broadcast_from_routes(host: Ipv4Addr, routes: &str) -> Option<Ipv4Addr> {
+    // Addresses are hex of the network-order bytes read as a native u32.
+    let addr = |hex: &str| {
+        u32::from_str_radix(hex, 16)
+            .ok()
+            .map(|n| u32::from_be_bytes(n.to_ne_bytes()))
+    };
+    let host = u32::from(host);
+    routes
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            let (dest, gateway, mask) = (addr(f.get(1)?)?, addr(f.get(2)?)?, addr(f.get(7)?)?);
+            (gateway == 0 && mask != 0 && host & mask == dest & mask).then_some((dest, mask))
+        })
+        .max_by_key(|&(_, mask)| mask.count_ones())
+        .map(|(dest, mask)| Ipv4Addr::from(dest & mask | !mask))
 }
 
 fn new_config(host: &str, mac: &str, broadcast: &str, input: &str) -> String {
@@ -236,11 +263,35 @@ fn run_cmd(program: &str, args: &[&str]) -> Result<()> {
 mod tests {
     use super::*;
 
+    // `/proc/net/route` from a /22 network, written for a little-endian host.
+    const ROUTES: &str = "\
+Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT
+enp1s0\t00000000\t0108A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
+enp1s0\t0008A8C0\t00000000\t0001\t0\t0\t100\t00FCFFFF\t0\t0\t0
+docker0\t000011AC\t00000000\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0
+";
+
     #[test]
-    fn broadcast_from_host() {
+    #[cfg(target_endian = "little")]
+    fn broadcast_from_route_table() {
+        let host = |s: &str| s.parse::<Ipv4Addr>().unwrap();
         assert_eq!(
-            default_broadcast("192.168.1.50"),
-            Some(Ipv4Addr::new(192, 168, 1, 255))
+            broadcast_from_routes(host("192.168.8.5"), ROUTES),
+            Some(Ipv4Addr::new(192, 168, 11, 255))
+        );
+        assert_eq!(
+            broadcast_from_routes(host("172.17.0.9"), ROUTES),
+            Some(Ipv4Addr::new(172, 17, 255, 255))
+        );
+        // Only reachable through the default route: no on-link subnet.
+        assert_eq!(broadcast_from_routes(host("10.0.0.5"), ROUTES), None);
+    }
+
+    #[test]
+    fn broadcast_fallback() {
+        assert_eq!(
+            default_broadcast("198.51.100.50"),
+            Some(Ipv4Addr::new(198, 51, 100, 255))
         );
         assert_eq!(default_broadcast("tv.local"), None);
     }
