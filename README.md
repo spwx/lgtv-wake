@@ -99,12 +99,18 @@ cargo zigbuild --release --target x86_64-unknown-linux-musl   # Linux build from
 
 Tests that talk to a real TV are ignored by default: `cargo test -- --ignored live_`.
 
+TLS uses rustls with the `ring` provider only. `aws-lc-rs` needs cmake and a C
+toolchain for cross builds, so `cargo tree -i aws-lc-rs --target all` should
+stay empty. `tokio-tungstenite`'s `rustls-tls-webpki-roots` feature brings in
+a root store, but it's never used: the pinned-certificate `ClientConfig` is
+passed in through `Connector::Rustls`.
+
 ## Releasing
 
 Bump `version` in `Cargo.toml`, commit, then tag and push:
 
 ```sh
-git tag v0.1.0 && git push origin v0.1.0
+git tag vX.Y.Z && git push origin vX.Y.Z
 ```
 
 The release workflow builds a static `x86_64-unknown-linux-musl` binary and attaches it,
