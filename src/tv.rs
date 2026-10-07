@@ -3,7 +3,7 @@
 use std::fmt;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 use tracing::{debug, info, warn};
 
@@ -23,6 +23,8 @@ const WAKE_BACKOFF: Duration = Duration::from_secs(1);
 const WAKE_RESEND: Duration = Duration::from_secs(3);
 /// How long `pair` waits for the prompt to be accepted.
 const PAIR_TIMEOUT: Duration = Duration::from_secs(60);
+/// `on`: wait at most this much longer than `wake_timeout` for a TV that's turning off.
+const SHUTDOWN_LIMIT: Duration = Duration::from_secs(30);
 /// Registration with a stored key (no prompt expected).
 const REGISTER_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -72,35 +74,31 @@ pub async fn on(cfg: &Config) -> Result<()> {
     let _lock = lock::acquire().await?;
 
     let start = Instant::now();
-    let (mut client, woke) = match Client::connect(cfg, PROBE_TIMEOUT).await {
-        Ok(client) => {
+    let (mut client, power, woke) = match probe(cfg, &key, PROBE_TIMEOUT).await? {
+        Probe::On(client, power) => {
             info!("TV is already on");
-            (client, false)
+            (*client, power, false)
         }
-        Err(e) if ssap::is_unreachable(&e) => {
+        Probe::Off(e) => {
             debug!("TV not answering ({e:#}), waking it");
-            let client = wake(cfg, start).await?;
-            info!("TV woke up after {:.1}s", start.elapsed().as_secs_f64());
-            (client, true)
+            let (client, power) = wake(cfg, &key, start).await?;
+            (client, power, true)
         }
-        Err(e) => return Err(e),
+        Probe::TurningOff(why) => {
+            info!("TV is turning off ({why}), waking it again once it's off");
+            let (client, power) = wake(cfg, &key, start).await?;
+            (client, power, true)
+        }
     };
 
-    client.register(Some(&key), REGISTER_TIMEOUT).await?;
-
     if woke {
-        match client.request(POWER_STATE, json!({})).await {
-            Ok(p) => {
-                let state = power_state(&p);
-                // Seen: "Suspend" right after a wake, then "Active" ~3s later; the
-                // input switch works either way.
-                if state != "Active" {
-                    info!(
-                        "TV power state after wake is {state:?} (usually becomes \"Active\" within seconds)"
-                    );
-                }
-            }
-            Err(e) => warn!("could not read the power state after wake: {e:#}"),
+        info!("TV woke up after {:.1}s", start.elapsed().as_secs_f64());
+        // Seen: "Suspend" right after a wake, then "Active" ~3s later; the input switch
+        // works either way.
+        if let Some(state) = power.as_ref().map(power_state).filter(|s| *s != "Active") {
+            info!(
+                "TV power state after wake is {state:?} (usually becomes \"Active\" within seconds)"
+            );
         }
     } else {
         // Skip the switch when it's already on the input: keyboard and mouse wakes repeat
@@ -128,9 +126,58 @@ pub async fn on(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
-/// Send magic packets and retry connecting until the TV answers or `wake_timeout` passes.
-async fn wake(cfg: &Config, start: Instant) -> Result<Client> {
-    let deadline = start + cfg.wake_timeout();
+/// What [`probe`] found.
+enum Probe {
+    /// On and registered, with the power state if the TV answered it.
+    On(Box<Client>, Option<Value>),
+    /// Not answering: off or in standby.
+    Off(anyhow::Error),
+    /// Still answering, but shutting down, with what it reported.
+    TurningOff(String),
+}
+
+/// Connect, register and read the power state. For a few seconds after `turnOff` the TV
+/// still answers with power `Active` and `processing` "Request Power Off Logo" (or
+/// "Prepare Active Standby"), then turns connections away with "Try Again Later", then
+/// stops answering (9–28s in all): the first two are [`Probe::TurningOff`].
+async fn probe(cfg: &Config, key: &str, timeout: Duration) -> Result<Probe> {
+    let classify = |e: anyhow::Error| {
+        if ssap::is_unreachable(&e) {
+            Ok(Probe::Off(e))
+        } else if ssap::is_busy(&e) {
+            Ok(Probe::TurningOff(format!("{e:#}")))
+        } else {
+            Err(e)
+        }
+    };
+    let mut client = match Client::connect(cfg, timeout).await {
+        Ok(client) => client,
+        Err(e) => return classify(e),
+    };
+    if let Err(e) = client.register(Some(key), REGISTER_TIMEOUT).await {
+        return classify(e);
+    }
+    match client.request(POWER_STATE, json!({})).await {
+        Ok(power) if turning_off(&power) => {
+            client.close().await;
+            Ok(Probe::TurningOff(format!("power: {}", power_text(&power))))
+        }
+        Ok(power) => Ok(Probe::On(Box::new(client), Some(power))),
+        // Turned away or gone mid-request: same as at connect.
+        Err(e) if ssap::is_unreachable(&e) || ssap::is_busy(&e) => classify(e),
+        Err(e) => {
+            warn!("could not read the power state: {e:#}");
+            Ok(Probe::On(Box::new(client), None))
+        }
+    }
+}
+
+/// Send magic packets and retry until the TV answers, registered, and isn't turning off.
+/// Gives up `wake_timeout` after the TV was last seen turning off (or after `start`), and
+/// [`SHUTDOWN_LIMIT`] later at most.
+async fn wake(cfg: &Config, key: &str, start: Instant) -> Result<(Client, Option<Value>)> {
+    let limit = start + cfg.wake_timeout() + SHUTDOWN_LIMIT;
+    let mut deadline = start + cfg.wake_timeout();
     let mut last_packet: Option<Instant> = None;
     loop {
         if last_packet.is_none_or(|t| t.elapsed() >= WAKE_RESEND) {
@@ -141,15 +188,19 @@ async fn wake(cfg: &Config, start: Instant) -> Result<Client> {
 
         let remaining = deadline.saturating_duration_since(Instant::now());
         let attempt = WAKE_CONNECT_TIMEOUT.min(remaining);
-        let err = match Client::connect(cfg, attempt).await {
-            Ok(client) => return Ok(client),
-            Err(e) => e,
+        // e.g. a TLS certificate mismatch is an error: retrying won't help.
+        let err = match probe(cfg, key, attempt).await? {
+            Probe::On(client, power) => return Ok((*client, power)),
+            Probe::Off(e) => {
+                debug!("not answering yet: {e:#}");
+                e
+            }
+            Probe::TurningOff(why) => {
+                debug!("still turning off: {why}");
+                deadline = (Instant::now() + cfg.wake_timeout()).min(limit);
+                anyhow!("the TV was still turning off ({why})")
+            }
         };
-        if !ssap::is_unreachable(&err) {
-            // e.g. a TLS certificate mismatch: retrying won't help.
-            return Err(err);
-        }
-        debug!("not answering yet: {err:#}");
 
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -176,7 +227,14 @@ pub async fn off(cfg: &Config) -> Result<()> {
         }
         Err(e) => return Err(e),
     };
-    client.register(Some(&key), REGISTER_TIMEOUT).await?;
+    if let Err(e) = client.register(Some(&key), REGISTER_TIMEOUT).await {
+        if ssap::is_busy(&e) {
+            info!("TV already turning off");
+            debug!("{e:#}");
+            return Ok(());
+        }
+        return Err(e);
+    }
 
     let app = client.request(FOREGROUND_APP, json!({})).await?;
     let app_id = app_id(&app);
@@ -207,7 +265,14 @@ pub async fn status(cfg: &Config) -> Result<()> {
         }
         Err(e) => return Err(e),
     };
-    client.register(Some(&key), REGISTER_TIMEOUT).await?;
+    if let Err(e) = client.register(Some(&key), REGISTER_TIMEOUT).await {
+        if ssap::is_busy(&e) {
+            debug!("{e:#}");
+            println!("power: turning off (connection turned away)");
+            return Err(Reported.into());
+        }
+        return Err(e);
+    }
     let power = client.request(POWER_STATE, json!({})).await?;
     let app = client.request(FOREGROUND_APP, json!({})).await?;
     client.close().await;
@@ -248,16 +313,30 @@ fn power_state(payload: &Value) -> &str {
     payload["state"].as_str().unwrap_or("unknown")
 }
 
+/// The power state, with `processing` when it adds something: `Active (Request Power Off Logo)`.
+fn power_text(power: &Value) -> String {
+    let state = power_state(power);
+    match power["processing"].as_str().filter(|p| *p != state) {
+        Some(processing) => format!("{state} ({processing})"),
+        None => state.to_owned(),
+    }
+}
+
+/// Whether the TV is shutting down: after `turnOff`, `processing` is "Request Power Off
+/// Logo", sometimes followed by "Prepare Active Standby".
+fn turning_off(power: &Value) -> bool {
+    power["processing"]
+        .as_str()
+        .is_some_and(|p| p.contains("Power Off") || p.contains("Standby"))
+}
+
 fn app_id(payload: &Value) -> &str {
     payload["appId"].as_str().unwrap_or_default()
 }
 
 /// `power: Active, input: HDMI_1 (com.webos.app.hdmi1)`.
 fn status_line(power: &Value, app: &Value) -> String {
-    let mut power_text = power_state(power).to_owned();
-    if let Some(processing) = power["processing"].as_str().filter(|p| *p != power_text) {
-        power_text = format!("{power_text} ({processing})");
-    }
+    let power_text = power_text(power);
     let app_id = app_id(app);
     let input = match app_input(app_id) {
         Some(input) => format!("input: {input} ({app_id})"),
@@ -290,6 +369,26 @@ mod tests {
         for input in ["HDMI_1", "HDMI_2", "HDMI_3", "HDMI_4"] {
             assert_eq!(app_input(&input_app_id(input)).as_deref(), Some(input));
         }
+    }
+
+    #[test]
+    fn turning_off_states() {
+        assert!(turning_off(
+            &json!({"state": "Active", "processing": "Request Power Off Logo"})
+        ));
+        assert!(turning_off(
+            &json!({"state": "Active Standby", "processing": "Request Power Off"})
+        ));
+        assert!(turning_off(
+            &json!({"state": "Active", "processing": "Prepare Active Standby"})
+        ));
+        assert!(!turning_off(&json!({"state": "Active"})));
+        assert!(!turning_off(
+            &json!({"state": "Suspend", "processing": "Screen On"})
+        ));
+        assert!(!turning_off(
+            &json!({"state": "Screen Off", "processing": "Screen Off"})
+        ));
     }
 
     #[test]

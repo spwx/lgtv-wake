@@ -157,11 +157,41 @@ impl Client {
                     tracing::trace!("<- {}", text.as_str());
                     return Ok(text.as_str().to_owned());
                 }
-                Message::Close(frame) => bail!("the TV closed the connection ({frame:?})"),
+                Message::Close(frame) => {
+                    return Err(Closed(frame.map(|f| f.reason.as_str().to_owned())).into());
+                }
                 _ => continue,
             }
         }
     }
+}
+
+/// The TV closed the websocket, with the close frame's reason if it sent one. While it
+/// shuts down it accepts connections for a few seconds, then closes them with "Try Again
+/// Later (EWS)".
+#[derive(Debug, Clone)]
+pub struct Closed(pub Option<String>);
+
+impl std::fmt::Display for Closed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            Some(reason) => write!(f, "the TV closed the connection ({reason})"),
+            None => f.write_str("the TV closed the connection"),
+        }
+    }
+}
+
+impl std::error::Error for Closed {}
+
+/// Whether the TV turned the connection away as busy ("Try Again Later"), as it does
+/// for a few seconds while shutting down.
+pub fn is_busy(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<Closed>()
+            .and_then(|c| c.0.as_deref())
+            .is_some_and(|reason| reason.contains("Try Again Later"))
+    })
 }
 
 /// [`Client::connect`] got no answer within the timeout.
@@ -517,6 +547,17 @@ mod tests {
         )));
         assert!(!is_unreachable(&tls));
         assert!(!is_unreachable(&anyhow!("something else")));
+    }
+
+    #[test]
+    fn busy_classification() {
+        let busy =
+            anyhow::Error::new(Closed(Some("Try Again Later (EWS)".into()))).context("registering");
+        assert!(is_busy(&busy));
+        assert!(!is_unreachable(&busy));
+        assert!(!is_busy(&anyhow::Error::new(Closed(None))));
+        assert!(!is_busy(&anyhow::Error::new(Closed(Some("bye".into())))));
+        assert!(!is_busy(&anyhow!("Try Again Later")));
     }
 
     /// Nothing listening on the port: connect fails fast and counts as unreachable.
