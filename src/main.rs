@@ -1,6 +1,9 @@
+mod cert;
 mod config;
+mod doctor;
 mod lock;
 mod marks;
+mod pin;
 mod setup;
 mod ssap;
 mod tls;
@@ -41,6 +44,14 @@ enum Command {
     Off,
     /// Print the TV's power state and current input
     Status,
+    /// Fetch the TV's TLS certificate and pin it (after a firmware update changed it)
+    Pin {
+        /// Pin without asking
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Check the config, client key, installed files and the TV connection
+    Doctor,
     /// Install the binary, config, systemd user unit and udev rule, then pair (Linux only)
     Setup(setup::Options),
     /// Download the latest release and run its setup (Linux only)
@@ -88,6 +99,9 @@ async fn run() -> Result<()> {
     if let Command::Update(opts) = &cli.command {
         return update::run(opts);
     }
+    if let Command::Doctor = cli.command {
+        return doctor::run().await;
+    }
 
     let cfg = Config::load()?;
 
@@ -96,7 +110,8 @@ async fn run() -> Result<()> {
         Command::On => tv::on(&cfg).await,
         Command::Off => tv::off(&cfg).await,
         Command::Status => tv::status(&cfg).await,
-        Command::Setup(_) | Command::Update(_) => unreachable!(),
+        Command::Pin { yes } => pin::run(&cfg, yes).await,
+        Command::Setup(_) | Command::Update(_) | Command::Doctor => unreachable!(),
         #[cfg(target_os = "linux")]
         Command::Watch { device } => watch::run(&cfg, &device).await,
         #[cfg(not(target_os = "linux"))]

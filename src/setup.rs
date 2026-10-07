@@ -17,9 +17,9 @@ use crate::tv;
 use crate::watch::CONTROLLER_NAME;
 
 const UNIT_FILE: &str = "tv-controller@.service";
-const UNIT: &str = include_str!("../deploy/tv-controller@.service");
-const RULE_PATH: &str = "/etc/udev/rules.d/90-lgtv-wake.rules";
-const RULE: &str = include_str!("../deploy/90-lgtv-wake.rules");
+pub const UNIT: &str = include_str!("../deploy/tv-controller@.service");
+pub const RULE_PATH: &str = "/etc/udev/rules.d/90-lgtv-wake.rules";
+pub const RULE: &str = include_str!("../deploy/90-lgtv-wake.rules");
 
 #[derive(Debug, clap::Args)]
 pub struct Options {
@@ -211,10 +211,7 @@ input = "{input}"
 
 /// Write `~/.config/systemd/user/tv-controller@.service` and reload the user manager.
 fn install_unit() -> Result<()> {
-    let path = dirs::config_dir()
-        .context("could not determine the config directory")?
-        .join("systemd/user")
-        .join(UNIT_FILE);
+    let path = unit_path()?;
     if fs::read_to_string(&path).ok().as_deref() == Some(UNIT) {
         println!("unit: {} is up to date", path.display());
         return Ok(());
@@ -224,6 +221,14 @@ fn install_unit() -> Result<()> {
     fs::write(&path, UNIT).with_context(|| format!("writing {}", path.display()))?;
     println!("unit: wrote {}", path.display());
     run_cmd("systemctl", &["--user", "daemon-reload"])
+}
+
+/// `~/.config/systemd/user/tv-controller@.service`.
+pub fn unit_path() -> Result<PathBuf> {
+    Ok(dirs::config_dir()
+        .context("could not determine the config directory")?
+        .join("systemd/user")
+        .join(UNIT_FILE))
 }
 
 /// Restart the running keyboard and mouse watchers so they run the new binary.

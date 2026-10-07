@@ -4,16 +4,24 @@
 //! doesn't match its address, so normal WebPKI verification can't work. Instead we
 //! pin the exact end-entity certificate, ignoring the name and the chain, and still
 //! check the handshake signatures so the server must hold the matching private key.
+//!
+//! The pin is `~/.config/lgtv-wake/tv-cert.der` if `lgtv-wake pin` saved one, otherwise
+//! the certificate embedded in the binary.
 
+use std::fs;
+use std::io::{ErrorKind, Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{WebPkiSupportedAlgorithms, ring};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
+use rustls::{ClientConfig, ClientConnection, DigitallySignedStruct, SignatureScheme};
 
-use crate::config::TlsMode;
+use crate::config::{self, TlsMode};
 
 /// The TV's leaf certificate (DER), fetched with
 /// `openssl s_client -connect 192.168.11.232:3001 -showcerts`.
@@ -23,23 +31,57 @@ pub const PINNED_CERT: &[u8] = include_bytes!("../certs/lg-c6.der");
 
 /// Text of the error returned when the TV presents a different certificate.
 pub const PIN_MISMATCH: &str = "TV certificate does not match the pinned certificate \
-     (a TV firmware update may have changed it): re-pin certs/lg-c6.der and rebuild, \
-     or set `tls = \"insecure\"` in ~/.config/lgtv-wake/config.toml";
+     (a TV firmware update may have changed it): run `lgtv-wake pin` with the TV on \
+     to pin the new one, or set `tls = \"insecure\"` in ~/.config/lgtv-wake/config.toml";
 
-/// Build a rustls `ClientConfig` (ring provider) that verifies the TV per `mode`.
-pub fn client_config(mode: TlsMode) -> Result<Arc<ClientConfig>> {
-    build(pin_for(mode))
+/// The certificate connections are checked against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pin {
+    pub der: Vec<u8>,
+    /// The file it came from, `None` for the one embedded in the binary.
+    pub path: Option<PathBuf>,
 }
 
-fn pin_for(mode: TlsMode) -> Option<&'static [u8]> {
-    match mode {
-        TlsMode::Pinned => Some(PINNED_CERT),
-        TlsMode::Insecure => None,
+impl Pin {
+    /// Where the pin came from, for messages.
+    pub fn source(&self) -> String {
+        match &self.path {
+            Some(path) => path.display().to_string(),
+            None => "embedded in the binary".to_owned(),
+        }
     }
 }
 
+/// The current pin: `~/.config/lgtv-wake/tv-cert.der` if it exists, else [`PINNED_CERT`].
+pub fn current_pin() -> Result<Pin> {
+    load_pin_from(&config::cert_path()?)
+}
+
+pub fn load_pin_from(path: &Path) -> Result<Pin> {
+    match fs::read(path) {
+        Ok(der) => Ok(Pin {
+            der,
+            path: Some(path.to_owned()),
+        }),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(Pin {
+            der: PINNED_CERT.to_vec(),
+            path: None,
+        }),
+        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+/// Build a rustls `ClientConfig` (ring provider) that verifies the TV per `mode`.
+pub fn client_config(mode: TlsMode) -> Result<Arc<ClientConfig>> {
+    let pinned = match mode {
+        TlsMode::Pinned => Some(current_pin()?.der),
+        TlsMode::Insecure => None,
+    };
+    build(pinned)
+}
+
 /// `pinned: None` accepts any certificate.
-fn build(pinned: Option<&'static [u8]>) -> Result<Arc<ClientConfig>> {
+fn build(pinned: Option<Vec<u8>>) -> Result<Arc<ClientConfig>> {
     let provider = Arc::new(ring::default_provider());
     let verifier = Arc::new(TvVerifier {
         pinned,
@@ -54,11 +96,72 @@ fn build(pinned: Option<&'static [u8]>) -> Result<Arc<ClientConfig>> {
     Ok(Arc::new(config))
 }
 
+/// Complete a TLS handshake with `host:port`, accepting any certificate (the handshake
+/// signatures are still checked), and return the server's end-entity certificate (DER).
+///
+/// Blocking. Network failures keep their `std::io::Error` in the chain, so
+/// [`crate::ssap::is_unreachable`] recognises a TV that's off.
+pub fn fetch_leaf(host: &str, port: u16, timeout: Duration) -> Result<Vec<u8>> {
+    let fetch = || -> Result<Vec<u8>> {
+        let name = ServerName::try_from(host.to_owned())
+            .with_context(|| format!("invalid host {host:?}"))?;
+        let mut conn = ClientConnection::new(build(None)?, name).context("starting TLS")?;
+        let addr = (host, port)
+            .to_socket_addrs()?
+            .next()
+            .context("no address for host")?;
+        let mut sock = TcpStream::connect_timeout(&addr, timeout)?;
+        sock.set_read_timeout(Some(timeout))?;
+        sock.set_write_timeout(Some(timeout))?;
+        let mut io = Timeouts(&mut sock);
+        while conn.is_handshaking() {
+            conn.complete_io(&mut io)?;
+        }
+        let leaf = conn
+            .peer_certificates()
+            .and_then(|certs| certs.first())
+            .context("the server sent no certificate")?
+            .to_vec();
+        conn.send_close_notify();
+        let _ = conn.complete_io(&mut io);
+        Ok(leaf)
+    };
+    fetch().with_context(|| format!("TLS handshake with {host}:{port}"))
+}
+
+/// Reports socket timeouts as `TimedOut`: Unix reports them as `WouldBlock`, which rustls
+/// would pass on as "try again".
+struct Timeouts<'a>(&'a mut TcpStream);
+
+fn timed_out(e: std::io::Error) -> std::io::Error {
+    if e.kind() == ErrorKind::WouldBlock {
+        ErrorKind::TimedOut.into()
+    } else {
+        e
+    }
+}
+
+impl Read for Timeouts<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read(buf).map_err(timed_out)
+    }
+}
+
+impl Write for Timeouts<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.write(buf).map_err(timed_out)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush().map_err(timed_out)
+    }
+}
+
 /// Accepts the pinned end-entity certificate (or any, if insecure); always checks signatures.
 #[derive(Debug)]
 struct TvVerifier {
     /// `None` accepts any certificate.
-    pinned: Option<&'static [u8]>,
+    pinned: Option<Vec<u8>>,
     algs: WebPkiSupportedAlgorithms,
 }
 
@@ -71,8 +174,8 @@ impl ServerCertVerifier for TvVerifier {
         _ocsp_response: &[u8],
         _now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        match self.pinned {
-            Some(pinned) if end_entity.as_ref() != pinned => {
+        match &self.pinned {
+            Some(pinned) if end_entity.as_ref() != pinned.as_slice() => {
                 Err(rustls::Error::General(PIN_MISMATCH.to_string()))
             }
             _ => Ok(ServerCertVerified::assertion()),
@@ -106,9 +209,9 @@ impl ServerCertVerifier for TvVerifier {
 mod tests {
     use super::*;
 
-    fn verify(mode: TlsMode, cert: &[u8]) -> Result<ServerCertVerified, rustls::Error> {
+    fn verify(pinned: Option<&[u8]>, cert: &[u8]) -> Result<ServerCertVerified, rustls::Error> {
         let v = TvVerifier {
-            pinned: pin_for(mode),
+            pinned: pinned.map(<[u8]>::to_vec),
             algs: ring::default_provider().signature_verification_algorithms,
         };
         let name = ServerName::try_from("192.168.11.232").unwrap();
@@ -131,23 +234,64 @@ mod tests {
 
     #[test]
     fn pinned_accepts_only_the_pinned_cert() {
-        assert!(verify(TlsMode::Pinned, PINNED_CERT).is_ok());
+        assert!(verify(Some(PINNED_CERT), PINNED_CERT).is_ok());
         let mut other = PINNED_CERT.to_vec();
         *other.last_mut().unwrap() ^= 1;
-        let err = verify(TlsMode::Pinned, &other).unwrap_err().to_string();
+        let err = verify(Some(PINNED_CERT), &other).unwrap_err().to_string();
         assert!(err.contains("tls = \"insecure\""), "{err}");
-        assert!(err.contains("re-pin"), "{err}");
+        assert!(err.contains("lgtv-wake pin"), "{err}");
+        // A re-pinned certificate replaces the embedded one.
+        assert!(verify(Some(&other), &other).is_ok());
+        assert!(verify(Some(&other), PINNED_CERT).is_err());
     }
 
     #[test]
     fn insecure_accepts_any_cert() {
-        assert!(verify(TlsMode::Insecure, b"not a certificate").is_ok());
+        assert!(verify(None, b"not a certificate").is_ok());
+    }
+
+    #[test]
+    fn pin_file_overrides_embedded() {
+        let dir = std::env::temp_dir().join(format!("lgtv-wake-pin-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tv-cert.der");
+        let _ = fs::remove_file(&path);
+
+        let pin = load_pin_from(&path).unwrap();
+        assert_eq!(pin.der, PINNED_CERT);
+        assert_eq!(pin.path, None);
+
+        fs::write(&path, b"other").unwrap();
+        let pin = load_pin_from(&path).unwrap();
+        assert_eq!(pin.der, b"other");
+        assert_eq!(pin.path.as_deref(), Some(path.as_path()));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn fetch_leaf_refused_is_unreachable() {
+        // Bind then drop a listener to get a closed local port.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let err = fetch_leaf("127.0.0.1", port, Duration::from_secs(1)).unwrap_err();
+        assert!(crate::ssap::is_unreachable(&err), "{err:#}");
     }
 
     #[test]
     fn builds_without_default_provider() {
-        client_config(TlsMode::Pinned).unwrap();
-        client_config(TlsMode::Insecure).unwrap();
+        build(Some(PINNED_CERT.to_vec())).unwrap();
+        build(None).unwrap();
+    }
+
+    /// `cargo test -- --ignored live_`
+    #[test]
+    #[ignore = "needs the TV on the network"]
+    fn live_fetch_leaf() {
+        let leaf = fetch_leaf("192.168.8.5", 3001, Duration::from_secs(5)).unwrap();
+        assert_eq!(leaf, PINNED_CERT);
     }
 
     /// Handshake with the real TV using a wrong pin; checks the error text survives
@@ -155,10 +299,9 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs the TV on the network"]
     async fn live_pin_mismatch_error() {
-        static WRONG: [u8; 3] = [0x30, 0x01, 0x00];
-        let cfg = build(Some(&WRONG)).unwrap();
+        let cfg = build(Some(vec![0x30, 0x01, 0x00])).unwrap();
         let err = tokio_tungstenite::connect_async_tls_with_config(
-            "wss://192.168.11.232:3001",
+            "wss://192.168.8.5:3001",
             None,
             true,
             Some(tokio_tungstenite::Connector::Rustls(cfg)),

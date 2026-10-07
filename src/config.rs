@@ -25,12 +25,13 @@ off_grace_secs = 30  # ignore keyboard and mouse this long after turning the TV 
 
 const CONFIG_FILE: &str = "config.toml";
 const KEY_FILE: &str = "client-key";
+const CERT_FILE: &str = "tv-cert.der";
 
 /// How the TV's TLS certificate is checked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TlsMode {
-    /// Accept only the certificate embedded in the binary.
+    /// Accept only the pinned certificate (`lgtv-wake pin`'s, else the embedded one).
     #[default]
     Pinned,
     /// Accept any certificate from the configured host.
@@ -176,6 +177,11 @@ pub fn config_path() -> Result<PathBuf> {
 
 pub fn key_path() -> Result<PathBuf> {
     Ok(config_dir()?.join(KEY_FILE))
+}
+
+/// The TV certificate saved by `lgtv-wake pin`, used instead of the embedded one.
+pub fn cert_path() -> Result<PathBuf> {
+    Ok(config_dir()?.join(CERT_FILE))
 }
 
 /// Load the client key from `~/.config/lgtv-wake/client-key`, `None` if not paired yet.
