@@ -27,7 +27,8 @@ when the device disconnects.
   this at most every 30 seconds, and the TV is left alone if it's already on
   `input`. Keyboards and mice never turn the TV off, and stay connected. The
   udev rule gives the logged-in user read access to mice, as systemd already
-  does for keyboards.
+  does for keyboards. Virtual QEMU devices (such as a Proxmox VM's USB tablet)
+  are skipped.
 
 It's a single static binary with no runtime dependencies. The TV's TLS
 certificate is pinned (`certs/lg-c6.der`), and the config and client key live
@@ -49,7 +50,9 @@ rm lgtv-wake
 1. copies itself to `~/.local/bin/lgtv-wake`;
 2. writes `~/.config/lgtv-wake/config.toml` if it doesn't exist, asking for the TV's IP and MAC address
    (or pass `--host`, `--mac`, `--broadcast`, `--input`);
-3. installs the user unit `~/.config/systemd/user/tv-controller@.service` and reloads systemd;
+3. installs the user unit `~/.config/systemd/user/tv-controller@.service` and reloads systemd,
+   then restarts the running keyboard and mouse watchers so they use the new binary
+   (controller watchers are left running, since starting one wakes the TV);
 4. installs the udev rule `/etc/udev/rules.d/90-lgtv-wake.rules` with `sudo`
    and applies it to the keyboards and mice already connected
    (`--no-sudo` prints the commands instead);
