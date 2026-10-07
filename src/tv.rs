@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use tracing::{debug, info, warn};
 
 use crate::config::{self, Config};
+use crate::marks::Mark;
 use crate::ssap::{self, Client};
 use crate::{lock, wol};
 
@@ -242,6 +243,10 @@ pub async fn off(cfg: &Config) -> Result<()> {
     if app_id == expected {
         client.request(TURN_OFF, json!({})).await?;
         info!("TV on {} ({app_id}), turned it off", cfg.input);
+        // Keyboard and mouse watchers ignore presses for a while after this.
+        if let Err(e) = Mark::Off.touch() {
+            warn!("{e:#}");
+        }
     } else {
         info!(
             "TV is showing {} rather than {} ({expected}), leaving it on",

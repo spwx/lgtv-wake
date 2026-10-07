@@ -18,14 +18,19 @@ when the device disconnects.
   is disconnected over Bluetooth, which powers it off, and the TV turns off
   under the same conditions as a long press. Steam's own idle setting can't
   power off an Xbox controller over Bluetooth, which otherwise stays on for
-  ~42 minutes. In Desktop Mode, controllers are left alone. Set
+  ~42 minutes. In Desktop Mode, controllers are left alone, and so are they
+  while a keyboard or mouse has been used (moved, scrolled or pressed) within
+  `idle_off_mins`, so a keyboard-and-mouse game keeps the TV on. Set
   `idle_off_mins = 0` to turn this off. This uses `loginctl` (to read the
   session's desktop) and `bluetoothctl`.
 - **Keyboard and mouse:** a key press or mouse click (not movement or
   scrolling) on a USB or Bluetooth keyboard or mouse, including ones with
   their own dongle, turns the TV on and switches to `input`. Each device does
   this at most every 30 seconds, and the TV is left alone if it's already on
-  `input`. Keyboards and mice never turn the TV off, and stay connected. The
+  `input`. For `off_grace_secs` (30) after lgtv-wake turns the TV off, key
+  presses and clicks are ignored, so bumping the desk while the TV shuts down
+  doesn't turn it back on; a controller connecting still does. Keyboards and
+  mice never turn the TV off, and stay connected. The
   udev rule gives the logged-in user read access to mice, as systemd already
   does for keyboards. Virtual QEMU devices (such as a Proxmox VM's USB tablet)
   are skipped.
@@ -95,6 +100,7 @@ input = "HDMI_1"
 # long_press_secs = 5
 # wake_timeout_secs = 20
 # idle_off_mins = 15
+# off_grace_secs = 30
 # tls = "insecure"
 ```
 

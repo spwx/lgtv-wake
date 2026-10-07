@@ -66,6 +66,7 @@ mod linux {
     use super::machine::{Action, Event, Machine};
     use super::{CONTROLLER_NAME, count_controllers_in, is_press};
     use crate::config::Config;
+    use crate::marks::Mark;
     use crate::tv;
 
     /// `ENODEV`: the device was removed (controller disconnected).
@@ -79,6 +80,10 @@ mod linux {
 
     /// Minimum time between TV wakes from one keyboard or mouse.
     const DESK_COOLDOWN: Duration = Duration::from_secs(30);
+
+    /// Minimum time between updates of [`Mark::Desk`] from one keyboard or mouse (the
+    /// idle-off it holds off is measured in minutes).
+    const DESK_MARK_EVERY: Duration = Duration::from_secs(10);
 
     const SYSFS_INPUT: &str = "/sys/class/input";
 
@@ -137,13 +142,17 @@ mod linux {
     }
 
     /// Keyboard or mouse: a key press or click turns the TV on and switches to `input`, at most
-    /// once per [`DESK_COOLDOWN`], so typing doesn't contact the TV on every key.
+    /// once per [`DESK_COOLDOWN`], so typing doesn't contact the TV on every key. Not within
+    /// `off_grace` of the TV being turned off, so a bump while it shuts down doesn't wake it.
+    /// Any input also updates [`Mark::Desk`], which holds off the controllers' idle-off.
     async fn desk(cfg: &Config, dev: Device, name: &str, path: &str) -> Result<()> {
         let mut events = dev
             .into_event_stream()
             .with_context(|| format!("reading {path}"))?;
         let mut wake: Option<TvFuture<'_>> = None;
         let mut last_wake: Option<Instant> = None;
+        let mut last_mark: Option<Instant> = None;
+        let mut last_ignored: Option<Instant> = None;
 
         info!("{name} ({path}): watching for key presses and clicks");
 
@@ -151,13 +160,30 @@ mod linux {
             tokio::select! {
                 res = events.next_event() => match res {
                     Ok(ev) => {
+                        if is_input(ev) && last_mark.is_none_or(|t| t.elapsed() >= DESK_MARK_EVERY) {
+                            last_mark = Some(Instant::now());
+                            if let Err(e) = Mark::Desk.touch() {
+                                warn!("{name} ({path}): {e:#}");
+                            }
+                        }
                         if wake.is_none()
                             && is_key_press(ev)
                             && last_wake.is_none_or(|t| t.elapsed() >= DESK_COOLDOWN)
                         {
-                            info!("{name} ({path}): key press, turning TV on");
-                            last_wake = Some(Instant::now());
-                            wake = Some(Box::pin(tv::on(cfg)));
+                            if let Some(ago) = Mark::Off.within(cfg.off_grace()) {
+                                // Log once per cooldown, not on every key.
+                                if last_ignored.is_none_or(|t| t.elapsed() >= DESK_COOLDOWN) {
+                                    info!(
+                                        "{name} ({path}): key press, but the TV was turned off {}s ago, leaving it off",
+                                        ago.as_secs()
+                                    );
+                                    last_ignored = Some(Instant::now());
+                                }
+                            } else {
+                                info!("{name} ({path}): key press, turning TV on");
+                                last_wake = Some(Instant::now());
+                                wake = Some(Box::pin(tv::on(cfg)));
+                            }
                         }
                     }
                     Err(e) if e.raw_os_error() == Some(ENODEV) => {
@@ -225,10 +251,16 @@ mod linux {
                     if machine.idle_deadline().is_some() =>
                 {
                     let game_mode = game_mode().await;
+                    let desk = cfg.idle_off().and_then(|idle| Mark::Desk.within(idle));
                     if !game_mode {
                         info!("{name} ({path}): idle, but not in Game Mode, leaving it connected");
+                    } else if let Some(ago) = desk {
+                        info!(
+                            "{name} ({path}): idle, but a keyboard or mouse was used {}s ago, leaving it connected",
+                            ago.as_secs()
+                        );
                     }
-                    Step::Event(Event::Idle { t: now(), game_mode })
+                    Step::Event(Event::Idle { t: now(), game_mode, desk_used: desk.is_some() })
                 }
                 res = async { wake.as_mut().expect("guarded by is_some").await }, if wake.is_some() => {
                     Step::WakeDone(res)
@@ -299,6 +331,15 @@ mod linux {
             log_tv_result(name, path, "on", w.await);
         }
         Ok(())
+    }
+
+    /// Any keyboard or mouse input, movement and scrolling included (not SYN or MSC_SCAN,
+    /// which only accompany other events).
+    fn is_input(ev: InputEvent) -> bool {
+        !matches!(
+            ev.destructure(),
+            EventSummary::Synchronization(..) | EventSummary::Misc(..)
+        )
     }
 
     fn is_key_press(ev: InputEvent) -> bool {
