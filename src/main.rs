@@ -8,6 +8,7 @@ mod update;
 mod watch;
 mod wol;
 
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -66,6 +67,8 @@ async fn main() -> ExitCode {
 async fn run() -> Result<()> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
+        // No colour escapes when logging to the journal or a file.
+        .with_ansi(std::io::stderr().is_terminal())
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
