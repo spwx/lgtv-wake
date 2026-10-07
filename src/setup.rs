@@ -1,7 +1,8 @@
-//! `setup`: install the binary, config, systemd user unit and udev rule (Linux).
+//! `setup`: install the binary, config, systemd user unit, udev rule and the sleep and
+//! power-off hooks (Linux).
 //!
 //! Safe to run again: it replaces the binary, keeps an existing config and
-//! client key, and only rewrites the unit and the rule when they changed.
+//! client key, and only rewrites the units, rule and hooks when they changed.
 
 use std::fs;
 use std::io::{self, IsTerminal, Write};
@@ -20,6 +21,12 @@ const UNIT_FILE: &str = "tv-controller@.service";
 const UNIT: &str = include_str!("../deploy/tv-controller@.service");
 const RULE_PATH: &str = "/etc/udev/rules.d/90-lgtv-wake.rules";
 const RULE: &str = include_str!("../deploy/90-lgtv-wake.rules");
+const SHUTDOWN_UNIT_PATH: &str = "/etc/systemd/system/lgtv-wake-shutdown@.service";
+const SHUTDOWN_UNIT: &str = include_str!("../deploy/lgtv-wake-shutdown@.service");
+const DISPATCHER_DIR: &str = "/etc/NetworkManager/dispatcher.d";
+const DISPATCHER_PATH: &str = "/etc/NetworkManager/dispatcher.d/pre-down.d/90-lgtv-wake";
+/// With `@USER@` for the user to run `lgtv-wake` as.
+const DISPATCHER: &str = include_str!("../deploy/90-lgtv-wake.dispatcher");
 
 #[derive(Debug, clap::Args)]
 pub struct Options {
@@ -35,7 +42,7 @@ pub struct Options {
     /// TV input to switch to, e.g. HDMI_1 (new config only)
     #[arg(long)]
     input: Option<String>,
-    /// Print the udev commands instead of running them with sudo
+    /// Print the commands that need root instead of running them with sudo
     #[arg(long)]
     no_sudo: bool,
     /// Don't pair with the TV
@@ -52,6 +59,7 @@ pub async fn run(opts: &Options) -> Result<()> {
     install_unit()?;
     restart_watchers();
     install_rule(opts.no_sudo)?;
+    install_power_hooks(opts.no_sudo)?;
 
     if config::load_client_key()?.is_some() {
         println!("client key: already paired");
@@ -289,40 +297,131 @@ fn install_rule(no_sudo: bool) -> Result<()> {
         println!("udev rule: {RULE_PATH} is up to date");
         return Ok(());
     }
-    let tmp = staged_rule_path();
-    fs::write(&tmp, RULE).with_context(|| format!("writing {}", tmp.display()))?;
-    let tmp = tmp.to_str().context("temp path is not UTF-8")?;
-    let install = ["install", "-m", "0644", tmp, RULE_PATH];
-    let reload = ["udevadm", "control", "--reload"];
-    // Apply the rule to keyboards and mice already connected; controllers start on connect.
-    let trigger = [
-        "udevadm",
-        "trigger",
-        "--action=change",
-        "--subsystem-match=input",
-        "--property-match=ID_INPUT_KEYBOARD=1",
-        "--property-match=ID_INPUT_MOUSE=1",
+    let tmp = stage("90-lgtv-wake.rules", RULE)?;
+    let cmds = [
+        cmd(&["install", "-m", "0644", &tmp, RULE_PATH]),
+        cmd(&["udevadm", "control", "--reload"]),
+        // Apply the rule to keyboards and mice already connected; controllers start on connect.
+        cmd(&[
+            "udevadm",
+            "trigger",
+            "--action=change",
+            "--subsystem-match=input",
+            "--property-match=ID_INPUT_KEYBOARD=1",
+            "--property-match=ID_INPUT_MOUSE=1",
+        ]),
     ];
-
-    if no_sudo {
-        println!(
-            "udev rule: run these to install it:\n  sudo {}\n  sudo {}\n  sudo {}",
-            install.join(" "),
-            reload.join(" "),
-            trigger.join(" ")
-        );
-        return Ok(());
-    }
-    println!("udev rule: installing {RULE_PATH} (sudo may ask for your password)");
-    run_cmd("sudo", &install)?;
-    run_cmd("sudo", &reload)?;
-    run_cmd("sudo", &trigger)?;
-    let _ = fs::remove_file(tmp);
-    Ok(())
+    as_root("udev rule", RULE_PATH, no_sudo, &cmds, &[tmp])
 }
 
-fn staged_rule_path() -> PathBuf {
-    std::env::temp_dir().join("90-lgtv-wake.rules")
+/// Install the power-off unit and the sleep hook, which turn the TV off when the system
+/// powers off or sleeps, with sudo (or print the commands with `--no-sudo`).
+fn install_power_hooks(no_sudo: bool) -> Result<()> {
+    let user = current_user()?;
+    let instance = shutdown_instance(&user);
+    let script = dispatcher_script(&user);
+    let unit_ok = fs::read_to_string(SHUTDOWN_UNIT_PATH).ok().as_deref() == Some(SHUTDOWN_UNIT);
+    // Without NetworkManager there's no pre-down hook, and sleep leaves the TV alone.
+    let nm = Path::new(DISPATCHER_DIR).is_dir();
+    let script_ok = !nm || fs::read_to_string(DISPATCHER_PATH).ok().as_deref() == Some(&script);
+    let enabled = ["is-enabled", "is-active"].iter().all(|check| {
+        Command::new("systemctl")
+            .args([check, "--quiet", instance.as_str()])
+            .status()
+            .is_ok_and(|s| s.success())
+    });
+    if !nm {
+        println!("power hooks: no NetworkManager, so sleep leaves the TV on");
+    }
+    if unit_ok && script_ok && enabled {
+        println!("power hooks: {instance} and the sleep hook are up to date");
+        return Ok(());
+    }
+
+    let mut staged = Vec::new();
+    let mut cmds = Vec::new();
+    if !unit_ok {
+        let tmp = stage("lgtv-wake-shutdown@.service", SHUTDOWN_UNIT)?;
+        cmds.push(cmd(&["install", "-m", "0644", &tmp, SHUTDOWN_UNIT_PATH]));
+        cmds.push(cmd(&["systemctl", "daemon-reload"]));
+        staged.push(tmp);
+    }
+    if !script_ok {
+        let tmp = stage("90-lgtv-wake.dispatcher", &script)?;
+        // `-D` creates pre-down.d if it's missing.
+        cmds.push(cmd(&["install", "-D", "-m", "0755", &tmp, DISPATCHER_PATH]));
+        staged.push(tmp);
+    }
+    cmds.push(cmd(&["systemctl", "enable", "--now", &instance]));
+    as_root("power hooks", &instance, no_sudo, &cmds, &staged)
+}
+
+/// The user running `setup`, whom the power hooks run `lgtv-wake` as.
+fn current_user() -> Result<String> {
+    let out = Command::new("id")
+        .arg("-un")
+        .output()
+        .context("running id -un")?;
+    let user = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    if !out.status.success() || !valid_user(&user) {
+        bail!("could not determine the user name (`id -un` gave {user:?})");
+    }
+    Ok(user)
+}
+
+/// A user name that's safe in a unit instance name and in a shell script.
+fn valid_user(user: &str) -> bool {
+    !user.is_empty()
+        && !user.starts_with('-')
+        && user
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+}
+
+fn shutdown_instance(user: &str) -> String {
+    format!("lgtv-wake-shutdown@{user}.service")
+}
+
+fn dispatcher_script(user: &str) -> String {
+    DISPATCHER.replace("@USER@", user)
+}
+
+/// Write `content` to a temp file for `sudo install` to copy into place.
+fn stage(name: &str, content: &str) -> Result<String> {
+    let path = std::env::temp_dir().join(name);
+    fs::write(&path, content).with_context(|| format!("writing {}", path.display()))?;
+    Ok(path.to_str().context("temp path is not UTF-8")?.to_owned())
+}
+
+fn cmd(args: &[&str]) -> Vec<String> {
+    args.iter().map(|a| a.to_string()).collect()
+}
+
+/// Run `cmds` with sudo and remove the `staged` files, or with `no_sudo` print the commands
+/// (keeping the files they install from).
+fn as_root(
+    label: &str,
+    what: &str,
+    no_sudo: bool,
+    cmds: &[Vec<String>],
+    staged: &[String],
+) -> Result<()> {
+    if no_sudo {
+        println!("{label}: run these to install {what}:");
+        for c in cmds {
+            println!("  sudo {}", c.join(" "));
+        }
+        return Ok(());
+    }
+    println!("{label}: installing {what} (sudo may ask for your password)");
+    for c in cmds {
+        let args: Vec<&str> = c.iter().map(String::as_str).collect();
+        run_cmd("sudo", &args)?;
+    }
+    for tmp in staged {
+        let _ = fs::remove_file(tmp);
+    }
+    Ok(())
 }
 
 pub fn run_cmd(program: &str, args: &[&str]) -> Result<()> {
@@ -447,5 +546,28 @@ tv-controller@event99.service loaded active running Watch event99 for the TV
         assert!(RULE.contains("SYSTEMD_USER_WANTS}+=\"tv-controller@%k.service\""));
         assert!(RULE.contains("LABEL=\"lgtv_wake_desk\""));
         assert!(RULE.contains("ATTRS{name}==\"QEMU*\", GOTO=\"lgtv_wake_end\""));
+        assert!(SHUTDOWN_UNIT.contains("User=%i"));
+        assert!(SHUTDOWN_UNIT.contains("/.local/bin/lgtv-wake\" system-off'"));
+        assert!(SHUTDOWN_UNIT.contains("WantedBy=multi-user.target"));
+        assert!(DISPATCHER.starts_with("#!/bin/sh\n"));
+    }
+
+    #[test]
+    fn power_hooks_for_user() {
+        assert_eq!(shutdown_instance("spw"), "lgtv-wake-shutdown@spw.service");
+        let script = dispatcher_script("spw");
+        assert!(script.contains("\nuser=spw\n"));
+        assert!(!script.contains("@USER@"));
+        assert!(script.contains("lgtv-wake\" system-off"));
+    }
+
+    #[test]
+    fn user_names() {
+        assert!(valid_user("spw"));
+        assert!(valid_user("first.last-2_x"));
+        assert!(!valid_user(""));
+        assert!(!valid_user("-rf"));
+        assert!(!valid_user("a b"));
+        assert!(!valid_user("a$(x)"));
     }
 }

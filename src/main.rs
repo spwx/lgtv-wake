@@ -1,5 +1,6 @@
 mod config;
 mod lock;
+mod power;
 mod setup;
 mod ssap;
 mod tls;
@@ -40,7 +41,9 @@ enum Command {
     Off,
     /// Print the TV's power state and current input
     Status,
-    /// Install the binary, config, systemd user unit and udev rule, then pair (Linux only)
+    /// Turn the TV off unless the system is rebooting (run by the sleep and power-off hooks)
+    SystemOff,
+    /// Install the binary, config, systemd units, udev rule and sleep hook, then pair (Linux only)
     Setup(setup::Options),
     /// Download the latest release and run its setup (Linux only)
     Update(update::Options),
@@ -95,6 +98,7 @@ async fn run() -> Result<()> {
         Command::On => tv::on(&cfg).await,
         Command::Off => tv::off(&cfg).await,
         Command::Status => tv::status(&cfg).await,
+        Command::SystemOff => power::run(&cfg).await,
         Command::Setup(_) | Command::Update(_) => unreachable!(),
         #[cfg(target_os = "linux")]
         Command::Watch { device } => watch::run(&cfg, &device).await,

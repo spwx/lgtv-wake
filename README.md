@@ -29,6 +29,15 @@ when the device disconnects.
   udev rule gives the logged-in user read access to mice, as systemd already
   does for keyboards. Virtual QEMU devices (such as a Proxmox VM's USB tablet)
   are skipped.
+- **Sleep and power-off:** when the system sleeps or powers off, the TV turns
+  off if it's on `input`. A reboot leaves it on. For sleep, a NetworkManager
+  `pre-down` script runs `lgtv-wake system-off` before NetworkManager takes the
+  network down (it does that as soon as sleep starts, so a `sleep.target` unit
+  would be too late). For power-off, the system unit
+  `lgtv-wake-shutdown@<user>.service` runs it as it stops, before the network
+  and D-Bus go down, and skips it if a reboot is queued (`systemctl list-jobs`).
+  Either way it gives up after 3 seconds, so it never holds up sleep or
+  shutdown for long.
 
 It's a single static binary with no runtime dependencies. The TV's TLS
 certificate is pinned (`certs/lg-c6.der`), and the config and client key live
@@ -56,10 +65,13 @@ rm lgtv-wake
 4. installs the udev rule `/etc/udev/rules.d/90-lgtv-wake.rules` with `sudo`
    and applies it to the keyboards and mice already connected
    (`--no-sudo` prints the commands instead);
-5. pairs with the TV if there's no client key yet (`--no-pair` skips it).
+5. installs the system unit `/etc/systemd/system/lgtv-wake-shutdown@.service`
+   and enables it for you, and installs the sleep hook
+   `/etc/NetworkManager/dispatcher.d/pre-down.d/90-lgtv-wake`, also with `sudo`;
+6. pairs with the TV if there's no client key yet (`--no-pair` skips it).
    The TV must be on: accept the prompt on screen.
 
-Both files are in [`deploy/`](deploy/) and are embedded in the binary.
+These files are in [`deploy/`](deploy/) and are embedded in the binary.
 
 Then turn a controller on or press a key, and watch the decisions:
 
@@ -77,6 +89,7 @@ journalctl -t lgtv-wake -f
 | `off` | Turn the TV off, only if it's on `input` |
 | `watch <device>` | The per-device loop that the udev rule starts (Linux only) |
 | `setup` | Install everything (Linux only) |
+| `system-off` | Turn the TV off unless the system is rebooting; run by the sleep and power-off hooks |
 | `update [--force]` | Download the latest release, check its SHA-256 and run its `setup` (Linux only) |
 
 `pair`, `status`, `on` and `off` also work on macOS, with the config in

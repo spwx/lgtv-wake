@@ -15,10 +15,10 @@ pub struct TvLock {
 }
 
 /// `$XDG_RUNTIME_DIR/lgtv-wake.lock`, or the temp dir when `XDG_RUNTIME_DIR` is unset
-/// (e.g. on macOS).
+/// (e.g. on macOS) or already removed (late in a shutdown).
 pub fn lock_path() -> PathBuf {
     let dir = std::env::var_os("XDG_RUNTIME_DIR")
-        .filter(|d| !d.is_empty())
+        .filter(|d| !d.is_empty() && Path::new(d).is_dir())
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
     dir.join(LOCK_FILE)

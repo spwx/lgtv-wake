@@ -1,0 +1,12 @@
+#!/bin/sh
+# Installed by `lgtv-wake setup` to /etc/NetworkManager/dispatcher.d/pre-down.d/90-lgtv-wake.
+# Before the system sleeps, NetworkManager takes the network down, but waits for pre-down
+# scripts first: turn the TV off here (only if it's on lgtv-wake's input) while it's still
+# reachable. logind waits at most ~5s for NetworkManager (InhibitDelayMaxSec), hence the timeout.
+[ "$2" = pre-down ] || exit 0
+# Only for sleep, not when a connection is taken down by hand.
+[ "$(nmcli -t -f STATE general 2>/dev/null)" = asleep ] || exit 0
+user=@USER@
+home=$(getent passwd "$user" | cut -d: -f6)
+exec systemd-cat -t lgtv-wake timeout 4 runuser -u "$user" -- \
+    env XDG_RUNTIME_DIR="/run/user/$(id -u "$user")" "$home/.local/bin/lgtv-wake" system-off
