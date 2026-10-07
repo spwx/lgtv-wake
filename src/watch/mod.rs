@@ -10,8 +10,7 @@ use std::ops::RangeInclusive;
 use std::path::Path;
 
 /// Device name of the real controller (Steam's virtual pad has a different name).
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-const CONTROLLER_NAME: &str = "Xbox Wireless Controller";
+pub const CONTROLLER_NAME: &str = "Xbox Wireless Controller";
 
 /// Key codes of touch and tool contacts (`BTN_TOOL_PEN..=BTN_TOOL_QUADTAP`, including
 /// `BTN_TOUCH`), sent by touchpads, tablets and touchscreens on contact rather than a click.

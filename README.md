@@ -49,7 +49,9 @@ rm lgtv-wake
 1. copies itself to `~/.local/bin/lgtv-wake`;
 2. writes `~/.config/lgtv-wake/config.toml` if it doesn't exist, asking for the TV's IP and MAC address
    (or pass `--host`, `--mac`, `--broadcast`, `--input`);
-3. installs the user unit `~/.config/systemd/user/tv-controller@.service` and reloads systemd;
+3. installs the user unit `~/.config/systemd/user/tv-controller@.service` and reloads systemd,
+   then restarts the running keyboard and mouse watchers so they use the new binary
+   (controller watchers are left running, since starting one wakes the TV);
 4. installs the udev rule `/etc/udev/rules.d/90-lgtv-wake.rules` with `sudo`
    and applies it to the keyboards and mice already connected
    (`--no-sudo` prints the commands instead);

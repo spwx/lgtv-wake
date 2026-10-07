@@ -7,13 +7,14 @@ use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::net::Ipv4Addr;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
 use crate::config::{self, Config};
 use crate::tv;
+use crate::watch::CONTROLLER_NAME;
 
 const UNIT_FILE: &str = "tv-controller@.service";
 const UNIT: &str = include_str!("../deploy/tv-controller@.service");
@@ -49,6 +50,7 @@ pub async fn run(opts: &Options) -> Result<()> {
     install_binary()?;
     let cfg = ensure_config(opts)?;
     install_unit()?;
+    restart_watchers();
     install_rule(opts.no_sudo)?;
 
     if config::load_client_key()?.is_some() {
@@ -223,6 +225,64 @@ fn install_unit() -> Result<()> {
     run_cmd("systemctl", &["--user", "daemon-reload"])
 }
 
+/// Restart the running keyboard and mouse watchers so they run the new binary.
+///
+/// Controller watchers are left alone: starting one wakes the TV and switches its input.
+/// Failures only warn, since the old watchers keep working.
+fn restart_watchers() {
+    let output = Command::new("systemctl")
+        .args(["--user", "list-units", "tv-controller@*"])
+        .args(["--state=active", "--plain", "--no-legend"])
+        .output();
+    let units = match output {
+        Ok(o) if o.status.success() => units_to_restart(
+            &String::from_utf8_lossy(&o.stdout),
+            Path::new("/sys/class/input"),
+        ),
+        Ok(o) => {
+            println!("watchers: could not list them ({})", o.status);
+            return;
+        }
+        Err(e) => {
+            println!("watchers: could not list them ({e})");
+            return;
+        }
+    };
+    if units.is_empty() {
+        return;
+    }
+    let mut args = vec!["--user", "restart"];
+    args.extend(units.iter().map(String::as_str));
+    match run_cmd("systemctl", &args) {
+        Ok(()) => println!("watchers: restarted {}", units.join(" ")),
+        Err(e) => println!("watchers: restart failed: {e:#}"),
+    }
+}
+
+/// The `tv-controller@eventN.service` units in `systemctl list-units --plain --no-legend`
+/// output whose device, looked up under `class_input` (normally `/sys/class/input`), isn't
+/// the controller. Units whose device name can't be read are skipped.
+fn units_to_restart(list_units: &str, class_input: &Path) -> Vec<String> {
+    list_units
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .filter(|unit| {
+            let Some(event) = unit
+                .strip_prefix("tv-controller@")
+                .and_then(|u| u.strip_suffix(".service"))
+            else {
+                return false;
+            };
+            if !event.starts_with("event") || event.contains('/') {
+                return false;
+            }
+            fs::read_to_string(class_input.join(event).join("device/name"))
+                .is_ok_and(|name| name.trim_end_matches(['\n', '\r']) != CONTROLLER_NAME)
+        })
+        .map(String::from)
+        .collect()
+}
+
 /// Install the udev rule with sudo (or print the commands with `--no-sudo`).
 fn install_rule(no_sudo: bool) -> Result<()> {
     if fs::read_to_string(RULE_PATH).ok().as_deref() == Some(RULE) {
@@ -325,6 +385,60 @@ docker0\t000011AC\t00000000\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0
         assert_eq!(cfg.host, "192.168.1.50");
         assert_eq!(cfg.input, "HDMI_1");
         assert_eq!(cfg.wake_delay_secs, 5);
+    }
+
+    #[test]
+    fn restarts_keyboards_and_mice_only() {
+        let t = TempDir::new();
+        t.device("event3", "AT Translated Set 2 keyboard");
+        t.device("event7", "Logitech USB Receiver Mouse");
+        t.device("event17", CONTROLLER_NAME);
+        // An eventN without a readable name (removed meanwhile) is skipped.
+        fs::create_dir_all(t.0.join("event30")).unwrap();
+        let list = "\
+tv-controller@event3.service  loaded active running Watch event3 for the TV
+tv-controller@event17.service loaded active running Watch event17 for the TV
+tv-controller@event30.service loaded active running Watch event30 for the TV
+tv-controller@event7.service  loaded active running Watch event7 for the TV
+tv-controller@event99.service loaded active running Watch event99 for the TV
+";
+        assert_eq!(
+            units_to_restart(list, &t.0),
+            [
+                "tv-controller@event3.service",
+                "tv-controller@event7.service"
+            ]
+        );
+        assert!(units_to_restart("", &t.0).is_empty());
+    }
+
+    /// Temp dir that removes itself on drop.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let dir = std::env::temp_dir()
+                .join(format!("lgtv-wake-setup-{}-{nanos}", std::process::id()));
+            fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        /// Add `<entry>/device/name` containing `name` plus a newline, like sysfs.
+        fn device(&self, entry: &str, name: &str) {
+            let dir = self.0.join(entry).join("device");
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("name"), format!("{name}\n")).unwrap();
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
     }
 
     #[test]
