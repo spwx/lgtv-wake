@@ -14,10 +14,11 @@ pub struct TvLock {
     _file: File,
 }
 
-/// `$XDG_RUNTIME_DIR`, or the temp dir when it's unset (e.g. on macOS).
+/// `$XDG_RUNTIME_DIR`, or the temp dir when it's unset (e.g. on macOS) or already removed
+/// (late in a shutdown).
 pub fn runtime_dir() -> PathBuf {
     std::env::var_os("XDG_RUNTIME_DIR")
-        .filter(|d| !d.is_empty())
+        .filter(|d| !d.is_empty() && Path::new(d).is_dir())
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
 }

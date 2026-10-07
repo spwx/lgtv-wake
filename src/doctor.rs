@@ -258,7 +258,51 @@ mod linux {
             Ok(path) => check_file(report, "user unit", &path, setup::UNIT),
             Err(e) => report.fail("user unit", format!("{e:#}"), ""),
         }
+        check_power_hooks(report);
         check_watchers(report);
+    }
+
+    /// The power-off unit is installed and enabled, and the sleep hook is installed (when
+    /// NetworkManager is there to run it).
+    fn check_power_hooks(report: &mut Report) {
+        let user = match setup::current_user() {
+            Ok(user) => user,
+            Err(e) => {
+                report.fail("power hooks", format!("{e:#}"), "");
+                return;
+            }
+        };
+        let path = setup::SHUTDOWN_UNIT_PATH.as_ref();
+        check_file(report, "power-off unit", path, setup::SHUTDOWN_UNIT);
+        let instance = setup::shutdown_instance(&user);
+        let enabled = Command::new("systemctl")
+            .args(["is-enabled", "--quiet", instance.as_str()])
+            .status()
+            .is_ok_and(|s| s.success());
+        if enabled {
+            report.ok("power-off unit", format!("{instance} enabled"));
+        } else {
+            report.fail(
+                "power-off unit",
+                format!("{instance} isn't enabled"),
+                "run `lgtv-wake setup`",
+            );
+        }
+        if std::path::Path::new(setup::DISPATCHER_DIR).is_dir() {
+            let script = setup::dispatcher_script(&user);
+            check_file(
+                report,
+                "sleep hook",
+                setup::DISPATCHER_PATH.as_ref(),
+                &script,
+            );
+        } else {
+            report.warn(
+                "sleep hook",
+                "no NetworkManager",
+                "sleep leaves the TV on; only power-off turns it off",
+            );
+        }
     }
 
     /// `~/.local/bin/lgtv-wake` exists and is this version.

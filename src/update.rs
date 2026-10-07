@@ -22,7 +22,7 @@ pub struct Options {
     /// Reinstall even if this is already the latest version
     #[arg(long)]
     force: bool,
-    /// Print the udev commands instead of running them with sudo
+    /// Print the commands that need root instead of running them with sudo
     #[arg(long)]
     no_sudo: bool,
 }

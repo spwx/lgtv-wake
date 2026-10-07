@@ -4,6 +4,7 @@ mod doctor;
 mod lock;
 mod marks;
 mod pin;
+mod power;
 mod setup;
 mod ssap;
 mod tls;
@@ -52,7 +53,9 @@ enum Command {
     },
     /// Check the config, client key, installed files and the TV connection
     Doctor,
-    /// Install the binary, config, systemd user unit and udev rule, then pair (Linux only)
+    /// Turn the TV off unless the system is rebooting (run by the sleep and power-off hooks)
+    SystemOff,
+    /// Install the binary, config, systemd units, udev rule and sleep hook, then pair (Linux only)
     Setup(setup::Options),
     /// Download the latest release and run its setup (Linux only)
     Update(update::Options),
@@ -111,6 +114,7 @@ async fn run() -> Result<()> {
         Command::Off => tv::off(&cfg).await,
         Command::Status => tv::status(&cfg).await,
         Command::Pin { yes } => pin::run(&cfg, yes).await,
+        Command::SystemOff => power::run(&cfg).await,
         Command::Setup(_) | Command::Update(_) | Command::Doctor => unreachable!(),
         #[cfg(target_os = "linux")]
         Command::Watch { device } => watch::run(&cfg, &device).await,
