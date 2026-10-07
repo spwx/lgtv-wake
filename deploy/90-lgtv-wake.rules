@@ -10,6 +10,9 @@ ACTION=="remove", GOTO="lgtv_wake_end"
 SUBSYSTEM!="input", GOTO="lgtv_wake_end"
 KERNEL!="event[0-9]*", GOTO="lgtv_wake_end"
 ENV{ID_BUS}!="usb|bluetooth", GOTO="lgtv_wake_end"
+# Skip QEMU's virtual USB tablet, keyboard and mouse (e.g. in a Proxmox VM), so a click in
+# the VM console doesn't turn the TV on. The name is on the parent input device.
+ATTRS{name}=="QEMU*", GOTO="lgtv_wake_end"
 ENV{ID_INPUT_KEYBOARD}=="1", GOTO="lgtv_wake_desk"
 ENV{ID_INPUT_MOUSE}=="1", GOTO="lgtv_wake_desk"
 GOTO="lgtv_wake_end"

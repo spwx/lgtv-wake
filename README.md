@@ -27,7 +27,8 @@ when the device disconnects.
   this at most every 30 seconds, and the TV is left alone if it's already on
   `input`. Keyboards and mice never turn the TV off, and stay connected. The
   udev rule gives the logged-in user read access to mice, as systemd already
-  does for keyboards.
+  does for keyboards. Virtual QEMU devices (such as a Proxmox VM's USB tablet)
+  are skipped.
 
 It's a single static binary with no runtime dependencies. The TV's TLS
 certificate is pinned (`certs/lg-c6.der`), and the config and client key live

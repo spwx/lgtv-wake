@@ -332,5 +332,6 @@ docker0\t000011AC\t00000000\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0
         assert!(UNIT.contains("ExecStart=%h/.local/bin/lgtv-wake watch /dev/input/%i"));
         assert!(RULE.contains("SYSTEMD_USER_WANTS}+=\"tv-controller@%k.service\""));
         assert!(RULE.contains("LABEL=\"lgtv_wake_desk\""));
+        assert!(RULE.contains("ATTRS{name}==\"QEMU*\", GOTO=\"lgtv_wake_end\""));
     }
 }
