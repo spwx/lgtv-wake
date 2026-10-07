@@ -18,8 +18,13 @@ pub enum Event {
     /// Periodic tick while waiting for the wake delay.
     Tick { t: Time },
     /// The idle deadline ([`Machine::idle_deadline`]) passed; `game_mode` is whether the
-    /// session is in Game Mode (idle-off only applies there).
-    Idle { t: Time, game_mode: bool },
+    /// session is in Game Mode (idle-off only applies there), `desk_used` whether a keyboard
+    /// or mouse was used within the idle-off time (it doesn't apply then either).
+    Idle {
+        t: Time,
+        game_mode: bool,
+        desk_used: bool,
+    },
     /// The device is gone (ENODEV).
     Gone { t: Time },
 }
@@ -196,18 +201,26 @@ impl Machine {
                 Action::None
             }
             (State::Running, Event::Tick { .. }) => Action::None,
-            (State::Running, Event::Idle { t, game_mode }) => {
+            (
+                State::Running,
+                Event::Idle {
+                    t,
+                    game_mode,
+                    desk_used,
+                },
+            ) => {
                 let Some(idle_off) = self.idle_off else {
                     return Action::None;
                 };
                 let idle = t.saturating_sub(self.idle_since);
                 if self.disconnecting.is_some() || idle < idle_off {
                     Action::None
-                } else if game_mode {
+                } else if game_mode && !desk_used {
                     self.disconnecting = Some(idle);
                     self.decide(Action::Disconnect, Reason::IdleTimeout { idle })
                 } else {
-                    // Not in Game Mode: start the idle clock over and check again later.
+                    // Not in Game Mode, or playing with a keyboard or mouse: start the idle
+                    // clock over and check again later.
                     self.idle_since = t;
                     Action::None
                 }
@@ -569,6 +582,15 @@ mod tests {
         Event::Idle {
             t: ms(t),
             game_mode,
+            desk_used: false,
+        }
+    }
+
+    fn idle_desk_used(t: u64) -> Event {
+        Event::Idle {
+            t: ms(t),
+            game_mode: true,
+            desk_used: true,
         }
     }
 
@@ -616,6 +638,24 @@ mod tests {
         // A later idle-off in Game Mode measures from the restart.
         assert_eq!(m.step(idle(1_801_000, true)), Action::Disconnect);
         assert_eq!(m.reason(), Some(Reason::IdleTimeout { idle: IDLE }));
+    }
+
+    #[test]
+    fn idle_while_desk_used_restarts_the_clock() {
+        let mut m = running();
+        assert_eq!(m.step(idle_desk_used(901_000)), Action::None);
+        assert_eq!(m.idle_deadline(), Some(ms(901_000) + IDLE));
+        // Once the keyboard and mouse go quiet too, idle-off applies again.
+        assert_eq!(m.step(idle(1_801_000, true)), Action::Disconnect);
+        assert_eq!(m.reason(), Some(Reason::IdleTimeout { idle: IDLE }));
+    }
+
+    #[test]
+    fn controller_dropping_while_desk_used_leaves_tv_on() {
+        let mut m = running();
+        assert_eq!(m.step(idle_desk_used(901_000)), Action::None);
+        assert_eq!(m.step(gone(2_521_000)), Action::Exit);
+        assert_eq!(m.reason(), Some(Reason::NoButtonHeld));
     }
 
     #[test]

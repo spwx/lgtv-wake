@@ -14,14 +14,17 @@ pub struct TvLock {
     _file: File,
 }
 
-/// `$XDG_RUNTIME_DIR/lgtv-wake.lock`, or the temp dir when `XDG_RUNTIME_DIR` is unset
-/// (e.g. on macOS).
-pub fn lock_path() -> PathBuf {
-    let dir = std::env::var_os("XDG_RUNTIME_DIR")
+/// `$XDG_RUNTIME_DIR`, or the temp dir when it's unset (e.g. on macOS).
+pub fn runtime_dir() -> PathBuf {
+    std::env::var_os("XDG_RUNTIME_DIR")
         .filter(|d| !d.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    dir.join(LOCK_FILE)
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+/// `$XDG_RUNTIME_DIR/lgtv-wake.lock`.
+pub fn lock_path() -> PathBuf {
+    runtime_dir().join(LOCK_FILE)
 }
 
 /// Block (without blocking the runtime) until the exclusive lock is held.

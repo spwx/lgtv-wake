@@ -19,6 +19,7 @@ wake_delay_secs = 5
 long_press_secs = 5
 wake_timeout_secs = 20
 idle_off_mins = 15   # Game Mode only; 0 disables
+off_grace_secs = 30  # ignore keyboard and mouse this long after turning the TV off
 # tls = "insecure"   # accept any certificate from `host` (if the pinned one changed)
 "#;
 
@@ -57,6 +58,10 @@ pub struct Config {
     /// Disconnect a controller idle this long in Game Mode (0 disables).
     #[serde(default = "default_idle_off")]
     pub idle_off_mins: u64,
+    /// Ignore keyboard and mouse presses this long after `off` turned the TV off, so a bump
+    /// while it shuts down doesn't wake it again (0 disables).
+    #[serde(default = "default_off_grace")]
+    pub off_grace_secs: u64,
     #[serde(default)]
     pub tls: TlsMode,
 }
@@ -72,6 +77,9 @@ fn default_wake_timeout() -> u64 {
 }
 fn default_idle_off() -> u64 {
     15
+}
+fn default_off_grace() -> u64 {
+    30
 }
 
 impl Config {
@@ -114,6 +122,11 @@ impl Config {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))] // used by `watch`
     pub fn idle_off(&self) -> Option<Duration> {
         (self.idle_off_mins > 0).then(|| Duration::from_secs(self.idle_off_mins * 60))
+    }
+
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))] // used by `watch`
+    pub fn off_grace(&self) -> Duration {
+        Duration::from_secs(self.off_grace_secs)
     }
 
     pub fn wake_timeout(&self) -> Duration {
@@ -236,6 +249,7 @@ input = "HDMI_1"
         assert_eq!(c.long_press_secs, 5);
         assert_eq!(c.wake_timeout_secs, 20);
         assert_eq!(c.idle_off(), Some(Duration::from_secs(900)));
+        assert_eq!(c.off_grace(), Duration::from_secs(30));
         assert_eq!(c.tls, TlsMode::Pinned);
     }
 
@@ -254,13 +268,14 @@ input = "HDMI_1"
     #[test]
     fn overrides_and_insecure_tls() {
         let text = format!(
-            "{MINIMAL}wake_delay_secs = 7\nlong_press_secs = 3\nwake_timeout_secs = 30\nidle_off_mins = 0\ntls = \"insecure\"\n"
+            "{MINIMAL}wake_delay_secs = 7\nlong_press_secs = 3\nwake_timeout_secs = 30\nidle_off_mins = 0\noff_grace_secs = 0\ntls = \"insecure\"\n"
         );
         let c = Config::parse(&text).unwrap();
         assert_eq!(c.wake_delay(), Duration::from_secs(7));
         assert_eq!(c.long_press(), Duration::from_secs(3));
         assert_eq!(c.wake_timeout(), Duration::from_secs(30));
         assert_eq!(c.idle_off(), None);
+        assert_eq!(c.off_grace(), Duration::ZERO);
         assert_eq!(c.tls, TlsMode::Insecure);
     }
 
