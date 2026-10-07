@@ -31,8 +31,8 @@ when the device disconnects.
   are skipped.
 
 It's a single static binary with no runtime dependencies. The TV's TLS
-certificate is pinned (`certs/lg-c6.der`), and the config and client key live
-in `~/.config/lgtv-wake/`.
+certificate is pinned (`certs/lg-c6.der`, or one saved by `lgtv-wake pin`), and
+the config and client key live in `~/.config/lgtv-wake/`.
 
 ## Install (Linux)
 
@@ -75,11 +75,13 @@ journalctl -t lgtv-wake -f
 | `status` | Print the power state and current input; exits 1 if the TV doesn't answer |
 | `on` | Wake the TV (Wake-on-LAN, retried until `wake_timeout_secs`) and switch to `input` |
 | `off` | Turn the TV off, only if it's on `input` |
+| `pin [--yes]` | Fetch the TV's TLS certificate, show it, and pin it (see below) |
+| `doctor` | Check the config, client key, TV connection, certificate and pairing, plus on Linux the installed binary, udev rule, user unit and running watchers; exits 1 if anything fails |
 | `watch <device>` | The per-device loop that the udev rule starts (Linux only) |
 | `setup` | Install everything (Linux only) |
 | `update [--force]` | Download the latest release, check its SHA-256 and run its `setup` (Linux only) |
 
-`pair`, `status`, `on` and `off` also work on macOS, with the config in
+`pair`, `status`, `on`, `off`, `pin` and `doctor` also work on macOS, with the config in
 `~/.config/lgtv-wake/` there too. Each machine needs its own client key.
 Set `RUST_LOG=debug` for more detail.
 
@@ -99,10 +101,16 @@ input = "HDMI_1"
 ```
 
 If a TV firmware update changes its certificate, connections fail with a pin
-mismatch. Either replace `certs/lg-c6.der` and make a new release, or set
-`tls = "insecure"` to accept any certificate from `host`.
+mismatch. With the TV on, run `lgtv-wake pin`: it prints the TV's certificate
+(subject, issuer, validity, SHA-256) next to the current pin, and after you
+confirm (or with `--yes`) saves it to `~/.config/lgtv-wake/tv-cert.der`. That
+file then replaces the certificate embedded in the binary (`certs/lg-c6.der`).
+Run it on each machine, and check the fingerprint is the one you expect: it
+trusts whatever answers at `host` at that moment. As a last resort,
+`tls = "insecure"` accepts any certificate from `host`.
 
-To re-pin, fetch the TV's leaf certificate (the first one printed) and convert it to DER:
+To update the embedded certificate instead, fetch the TV's leaf certificate
+(the first one printed), convert it to DER, and make a new release:
 
 ```sh
 openssl s_client -connect <tv-ip>:3001 -showcerts </dev/null 2>/dev/null \
