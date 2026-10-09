@@ -53,7 +53,7 @@ enum Command {
     },
     /// Check the config, client key, installed files and the TV connection
     Doctor,
-    /// Turn the TV off unless the system is rebooting (run by the sleep and power-off hooks)
+    /// Disconnect the controllers and turn the TV off unless the system is rebooting (run by the sleep and power-off hooks)
     SystemOff,
     /// Install the binary, config, systemd units, udev rule and sleep hook, then pair (Linux only)
     Setup(setup::Options),

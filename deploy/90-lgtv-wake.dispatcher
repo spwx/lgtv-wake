@@ -1,8 +1,9 @@
 #!/bin/sh
 # Installed by `lgtv-wake setup` to /etc/NetworkManager/dispatcher.d/pre-down.d/90-lgtv-wake.
 # Before the system sleeps, NetworkManager takes the network down, but waits for pre-down
-# scripts first: turn the TV off here (only if it's on lgtv-wake's input) while it's still
-# reachable. logind waits at most ~5s for NetworkManager (InhibitDelayMaxSec), hence the timeout.
+# scripts first: disconnect the Xbox controllers and turn the TV off here (only if it's on
+# lgtv-wake's input) while it's still reachable. logind waits at most ~5s for NetworkManager
+# (InhibitDelayMaxSec), hence the timeout.
 [ "$2" = pre-down ] || exit 0
 # Only for sleep, not when a connection is taken down by hand.
 [ "$(nmcli -t -f STATE general 2>/dev/null)" = asleep ] || exit 0

@@ -1,11 +1,12 @@
 # Installed by `lgtv-wake setup` to /etc/systemd/system/ and enabled as
-# lgtv-wake-shutdown@<user>.service. When the system powers off (not when it reboots), turns
-# the TV off if it's on lgtv-wake's input, running `lgtv-wake system-off` as <user>.
+# lgtv-wake-shutdown@<user>.service. When the system powers off (not when it reboots),
+# disconnects the Xbox controllers and turns the TV off if it's on lgtv-wake's input, running
+# `lgtv-wake system-off` as <user>.
 [Unit]
-Description=Turn the LG TV off at power-off (lgtv-wake for %i)
-# Units stop in reverse order at shutdown, so ExecStop runs while the network and D-Bus
-# (for `systemctl list-jobs`) are still up.
-After=network.target NetworkManager.service dbus.service
+Description=Disconnect controllers and turn the LG TV off at power-off (lgtv-wake for %i)
+# Units stop in reverse order at shutdown, so ExecStop runs while the network, D-Bus (for
+# `systemctl list-jobs`) and bluetoothd (for `bluetoothctl disconnect`) are still up.
+After=network.target NetworkManager.service dbus.service bluetooth.service
 
 [Service]
 Type=oneshot

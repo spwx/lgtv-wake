@@ -12,6 +12,8 @@ use std::path::Path;
 /// Device name of the real controller (Steam's virtual pad has a different name).
 pub const CONTROLLER_NAME: &str = "Xbox Wireless Controller";
 
+pub const SYSFS_INPUT: &str = "/sys/class/input";
+
 /// Key codes of touch and tool contacts (`BTN_TOOL_PEN..=BTN_TOOL_QUADTAP`, including
 /// `BTN_TOUCH`), sent by touchpads, tablets and touchscreens on contact rather than a click.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -47,6 +49,36 @@ fn count_controllers_in(class_input: &Path, own: Option<&OsStr>) -> io::Result<u
     Ok(count)
 }
 
+/// Bluetooth addresses (`device/uniq`) of the controllers connected under `class_input`
+/// (normally `/sys/class/input`), sorted and without duplicates. A controller without an
+/// address (e.g. on USB) is skipped, as are entries that can't be read.
+pub fn controller_macs_in(class_input: &Path) -> io::Result<Vec<String>> {
+    let mut macs = Vec::new();
+    for entry in fs::read_dir(class_input)? {
+        let entry = entry?;
+        if !entry.file_name().to_string_lossy().starts_with("event") {
+            continue;
+        }
+        let device = entry.path().join("device");
+        let Ok(name) = fs::read_to_string(device.join("name")) else {
+            continue;
+        };
+        if name.trim_end_matches(['\n', '\r']) != CONTROLLER_NAME {
+            continue;
+        }
+        let Ok(uniq) = fs::read_to_string(device.join("uniq")) else {
+            continue;
+        };
+        let mac = uniq.trim();
+        if !mac.is_empty() {
+            macs.push(mac.to_owned());
+        }
+    }
+    macs.sort();
+    macs.dedup();
+    Ok(macs)
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
     use std::ffi::OsString;
@@ -64,7 +96,7 @@ mod linux {
     use tracing::{error, info, warn};
 
     use super::machine::{Action, Event, Machine};
-    use super::{CONTROLLER_NAME, count_controllers_in, is_press};
+    use super::{CONTROLLER_NAME, SYSFS_INPUT, count_controllers_in, is_press};
     use crate::config::Config;
     use crate::marks::Mark;
     use crate::tv;
@@ -84,8 +116,6 @@ mod linux {
     /// Minimum time between updates of [`Mark::Desk`] from one keyboard or mouse (the
     /// idle-off it holds off is measured in minutes).
     const DESK_MARK_EVERY: Duration = Duration::from_secs(10);
-
-    const SYSFS_INPUT: &str = "/sys/class/input";
 
     /// logind's `Desktop` for the Steam Game Mode session.
     const GAME_MODE_DESKTOP: &str = "gamescope";
@@ -523,5 +553,23 @@ mod tests {
     fn missing_root_is_an_error() {
         let t = TempDir::new();
         assert!(count_controllers_in(&t.0.join("nope"), None).is_err());
+        assert!(controller_macs_in(&t.0.join("nope")).is_err());
+    }
+
+    #[test]
+    fn finds_controller_macs() {
+        let t = fake_sysfs();
+        let uniq = |entry: &str, mac: &str| {
+            fs::write(t.0.join(entry).join("device/uniq"), format!("{mac}\n")).unwrap();
+        };
+        uniq("event17", "ac:8e:bd:46:22:70");
+        // The same controller's other event device, and a USB one with no address.
+        fs::create_dir_all(t.0.join("event18/device")).unwrap();
+        fs::write(t.0.join("event18/device/name"), CONTROLLER_NAME).unwrap();
+        uniq("event18", "ac:8e:bd:46:22:70");
+        uniq("event21", "");
+        uniq("event3", "ed:90:92:e0:26:18");
+        uniq("input42", "11:22:33:44:55:66");
+        assert_eq!(controller_macs_in(&t.0).unwrap(), ["ac:8e:bd:46:22:70"]);
     }
 }

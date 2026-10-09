@@ -1,18 +1,23 @@
-//! `system-off`: turn the TV off when the system sleeps or powers off, but not when it
-//! reboots. Run by the hooks `setup` installs: a NetworkManager pre-down script (sleep) and
-//! the `lgtv-wake-shutdown@.service` system unit (power-off).
+//! `system-off`: disconnect the Xbox controllers over Bluetooth (which powers them off) and
+//! turn the TV off when the system sleeps or powers off, but not when it reboots. Run by the
+//! hooks `setup` installs: a NetworkManager pre-down script (sleep) and the
+//! `lgtv-wake-shutdown@.service` system unit (power-off).
 
+use std::path::Path;
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use tokio::process::Command;
+use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 use crate::config::Config;
 use crate::tv;
+use crate::watch::{SYSFS_INPUT, controller_macs_in};
 
-/// Give up after this long, so sleep or shutdown is never held up for long. A TV that's on
-/// answers well within it; one in standby doesn't answer at all.
+/// Give up on the TV and on each disconnect after this long, so sleep or shutdown is never
+/// held up for long. A TV that's on answers well within it; one in standby doesn't answer at
+/// all.
 const LIMIT: Duration = Duration::from_secs(3);
 
 /// Targets whose start job means the system is restarting rather than powering off.
@@ -23,6 +28,12 @@ pub async fn run(cfg: &Config) -> Result<()> {
         info!("system is rebooting ({target}), leaving the TV on");
         return Ok(());
     }
+    // Both at once, so together they still take at most `LIMIT`.
+    let (tv, ()) = tokio::join!(tv_off(cfg), disconnect_controllers());
+    tv
+}
+
+async fn tv_off(cfg: &Config) -> Result<()> {
     match tokio::time::timeout(LIMIT, tv::off(cfg)).await {
         Ok(res) => res,
         Err(_) => bail!(
@@ -30,6 +41,53 @@ pub async fn run(cfg: &Config) -> Result<()> {
             LIMIT.as_secs()
         ),
     }
+}
+
+/// Disconnect every connected controller, logging (not returning) failures, so they never
+/// stop the TV from turning off.
+async fn disconnect_controllers() {
+    let macs = match controller_macs_in(Path::new(SYSFS_INPUT)) {
+        Ok(macs) => macs,
+        Err(e) => {
+            warn!("listing controllers in {SYSFS_INPUT}: {e}");
+            return;
+        }
+    };
+    let mut tasks = JoinSet::new();
+    for mac in macs {
+        tasks.spawn(async move {
+            let res = disconnect(&mac).await;
+            (mac, res)
+        });
+    }
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok((mac, Ok(()))) => info!("disconnected controller {mac}"),
+            Ok((mac, Err(e))) => warn!("disconnecting controller {mac}: {e:#}"),
+            Err(e) => warn!("disconnecting a controller: {e}"),
+        }
+    }
+}
+
+/// Disconnect one controller with `bluetoothctl`, within `LIMIT`.
+async fn disconnect(mac: &str) -> Result<()> {
+    let out = tokio::time::timeout(
+        LIMIT,
+        Command::new("bluetoothctl")
+            .args(["disconnect", mac])
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .context("bluetoothctl timed out")?
+    .context("running bluetoothctl")?;
+    anyhow::ensure!(
+        out.status.success(),
+        "bluetoothctl failed ({}): {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    Ok(())
 }
 
 /// The reboot target systemd is starting, if any. When it can't tell, assume a power-off.
