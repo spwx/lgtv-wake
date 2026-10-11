@@ -14,7 +14,10 @@ when the device disconnects.
 
 - **Wake:** a controller connects and either sends input or stays connected
   for `wake_delay_secs`. A controller waking up from idle and immediately
-  dropping again (a "ghost" reconnect) doesn't wake the TV.
+  dropping again (a "ghost" reconnect) doesn't wake the TV. A controller that
+  connects while another is already connected leaves the TV alone, so joining a
+  game doesn't switch the TV back from another input; controllers turned on
+  together still wake it.
 - **Off:** the controller disconnects after the Xbox button was held for
   `long_press_secs`, no other controller is connected, and the TV is still on
   the configured input. If the TV is on something else, it's left alone.

@@ -3,7 +3,7 @@
 
 pub mod machine;
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
 use std::ops::RangeInclusive;
@@ -37,13 +37,13 @@ fn is_press(code: u16, value: i32) -> bool {
     value == 1 && !DIGITIZER_KEYS.contains(&code)
 }
 
-/// Count `eventN` entries under `class_input` (normally `/sys/class/input`) whose
-/// `device/name` is a controller ([`is_controller`]), skipping the one named `own`.
+/// The `eventN` entries under `class_input` (normally `/sys/class/input`) whose
+/// `device/name` is a controller ([`is_controller`]), skipping the one named `own`, sorted.
 ///
 /// Entries whose name can't be read (e.g. removed while we look) are skipped.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn count_controllers_in(class_input: &Path, own: Option<&OsStr>) -> io::Result<usize> {
-    let mut count = 0;
+fn controllers_in(class_input: &Path, own: Option<&OsStr>) -> io::Result<Vec<OsString>> {
+    let mut controllers = Vec::new();
     for entry in fs::read_dir(class_input)? {
         let entry = entry?;
         let file_name = entry.file_name();
@@ -54,10 +54,17 @@ fn count_controllers_in(class_input: &Path, own: Option<&OsStr>) -> io::Result<u
             continue;
         };
         if is_controller(&name) {
-            count += 1;
+            controllers.push(file_name);
         }
     }
-    Ok(count)
+    controllers.sort();
+    Ok(controllers)
+}
+
+/// How many of the `earlier` controllers (as from [`controllers_in`]) are in `now`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn still_connected(earlier: &[OsString], now: &[OsString]) -> usize {
+    earlier.iter().filter(|c| now.contains(c)).count()
 }
 
 /// Bluetooth addresses (`device/uniq`) of the controllers connected under `class_input`
@@ -107,7 +114,7 @@ mod linux {
     use tracing::{error, info, warn};
 
     use super::machine::{Action, Event, Machine};
-    use super::{SYSFS_INPUT, count_controllers_in, is_controller, is_press};
+    use super::{SYSFS_INPUT, controllers_in, is_controller, is_press, still_connected};
     use crate::config::Config;
     use crate::marks::Mark;
     use crate::tv;
@@ -260,6 +267,9 @@ mod linux {
     ) -> Result<()> {
         // Resolve our own eventN now: once the device is gone, the node is too.
         let own = own_event_name(device);
+        // The controllers already connected when this one connected. Only these hold back
+        // its wake, so two controllers turned on together don't both leave the TV off.
+        let earlier = other_controllers(own.as_deref());
 
         // Bluetooth address, for the idle-off disconnect. A controller without one (on a
         // dongle or USB) can't be powered off from here, so it gets no idle-off.
@@ -331,21 +341,23 @@ mod linux {
                 .map_or_else(|| "unknown".to_owned(), |r| r.to_string());
             match action {
                 Action::None => {}
-                Action::Wake => match other_controllers(own.as_deref()) {
-                    0 => {
-                        info!("{name} ({path}): wake ({reason}), turning TV on");
-                        wake = Some(Box::pin(tv::on(cfg)));
+                Action::Wake => {
+                    match still_connected(&earlier, &other_controllers(own.as_deref())) {
+                        0 => {
+                            info!("{name} ({path}): wake ({reason}), turning TV on");
+                            wake = Some(Box::pin(tv::on(cfg)));
+                        }
+                        n => info!(
+                            "{name} ({path}): wake ({reason}), but other controller connected before it ({n}), leaving TV alone"
+                        ),
                     }
-                    n => info!(
-                        "{name} ({path}): wake ({reason}), but other controller connected ({n}), leaving TV alone"
-                    ),
-                },
+                }
                 Action::Off => {
                     // Let a wake still in flight finish first, so `off` doesn't race it.
                     if let Some(w) = wake.take() {
                         log_tv_result(name, path, "on", w.await);
                     }
-                    match other_controllers(own.as_deref()) {
+                    match other_controllers(own.as_deref()).len() {
                         0 => {
                             info!("{name} ({path}): off ({reason}), turning TV off");
                             log_tv_result(name, path, "off", tv::off(cfg).await);
@@ -455,10 +467,10 @@ mod linux {
     }
 
     /// Other connected controllers; on a sysfs error, log and assume none.
-    fn other_controllers(own: Option<&std::ffi::OsStr>) -> usize {
-        count_controllers_in(Path::new(SYSFS_INPUT), own).unwrap_or_else(|e| {
-            warn!("counting controllers in {SYSFS_INPUT}: {e}, assuming none");
-            0
+    fn other_controllers(own: Option<&std::ffi::OsStr>) -> Vec<OsString> {
+        controllers_in(Path::new(SYSFS_INPUT), own).unwrap_or_else(|e| {
+            warn!("listing controllers in {SYSFS_INPUT}: {e}, assuming none");
+            Vec::new()
         })
     }
 
@@ -533,7 +545,7 @@ mod tests {
     #[test]
     fn counts_other_controllers() {
         let t = fake_sysfs();
-        let count = |own: Option<&str>| count_controllers_in(&t.0, own.map(OsStr::new)).unwrap();
+        let count = |own: Option<&str>| controllers_in(&t.0, own.map(OsStr::new)).unwrap().len();
         assert_eq!(count(Some("event17")), 2);
         assert_eq!(count(Some("event15")), 2);
         assert_eq!(count(Some("event3")), 3);
@@ -546,9 +558,31 @@ mod tests {
         t.device("event17", CONTROLLER_NAMES[0]);
         t.device("event5", "Power Button");
         assert_eq!(
-            count_controllers_in(&t.0, Some(OsStr::new("event17"))).unwrap(),
+            controllers_in(&t.0, Some(OsStr::new("event17")))
+                .unwrap()
+                .len(),
             0
         );
+    }
+
+    #[test]
+    fn only_earlier_controllers_hold_back_a_wake() {
+        let t = TempDir::new();
+        // A connects with no other controller; B connects while A is there.
+        t.device("event15", CONTROLLER_NAMES[1]);
+        let a_earlier = controllers_in(&t.0, Some(OsStr::new("event15"))).unwrap();
+        t.device("event16", CONTROLLER_NAMES[1]);
+        let b_earlier = controllers_in(&t.0, Some(OsStr::new("event16"))).unwrap();
+        assert_eq!(b_earlier, ["event15"]);
+
+        // At their wake delays both are connected: A wakes the TV, B leaves it alone.
+        let now = |own: &str| controllers_in(&t.0, Some(OsStr::new(own))).unwrap();
+        assert_eq!(still_connected(&a_earlier, &now("event15")), 0);
+        assert_eq!(still_connected(&b_earlier, &now("event16")), 1);
+
+        // If A is gone by B's wake, B wakes the TV.
+        fs::remove_dir_all(t.0.join("event15")).unwrap();
+        assert_eq!(still_connected(&b_earlier, &now("event16")), 0);
     }
 
     #[test]
@@ -572,7 +606,7 @@ mod tests {
     #[test]
     fn missing_root_is_an_error() {
         let t = TempDir::new();
-        assert!(count_controllers_in(&t.0.join("nope"), None).is_err());
+        assert!(controllers_in(&t.0.join("nope"), None).is_err());
         assert!(controller_macs_in(&t.0.join("nope")).is_err());
     }
 
