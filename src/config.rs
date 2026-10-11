@@ -16,7 +16,7 @@ broadcast = "192.168.1.255"
 input = "HDMI_1"
 # optional, with these defaults:
 wake_delay_secs = 5
-long_press_secs = 5
+long_press_secs = 3
 wake_timeout_secs = 20
 idle_off_mins = 15   # Game Mode only; 0 disables
 off_grace_secs = 30  # ignore keyboard and mouse this long after turning the TV off
@@ -70,8 +70,9 @@ pub struct Config {
 fn default_wake_delay() -> u64 {
     5
 }
+/// Below the ~3.5 s hold that powers off an 8BitDo Ultimate 2C (an Xbox controller takes ~6 s).
 fn default_long_press() -> u64 {
-    5
+    3
 }
 fn default_wake_timeout() -> u64 {
     20
@@ -252,7 +253,7 @@ input = "HDMI_1"
         assert_eq!(c.broadcast, Ipv4Addr::new(192, 168, 11, 255));
         assert_eq!(c.input, "HDMI_1");
         assert_eq!(c.wake_delay_secs, 5);
-        assert_eq!(c.long_press_secs, 5);
+        assert_eq!(c.long_press_secs, 3);
         assert_eq!(c.wake_timeout_secs, 20);
         assert_eq!(c.idle_off(), Some(Duration::from_secs(900)));
         assert_eq!(c.off_grace(), Duration::from_secs(30));
@@ -274,11 +275,11 @@ input = "HDMI_1"
     #[test]
     fn overrides_and_insecure_tls() {
         let text = format!(
-            "{MINIMAL}wake_delay_secs = 7\nlong_press_secs = 3\nwake_timeout_secs = 30\nidle_off_mins = 0\noff_grace_secs = 0\ntls = \"insecure\"\n"
+            "{MINIMAL}wake_delay_secs = 7\nlong_press_secs = 4\nwake_timeout_secs = 30\nidle_off_mins = 0\noff_grace_secs = 0\ntls = \"insecure\"\n"
         );
         let c = Config::parse(&text).unwrap();
         assert_eq!(c.wake_delay(), Duration::from_secs(7));
-        assert_eq!(c.long_press(), Duration::from_secs(3));
+        assert_eq!(c.long_press(), Duration::from_secs(4));
         assert_eq!(c.wake_timeout(), Duration::from_secs(30));
         assert_eq!(c.idle_off(), None);
         assert_eq!(c.off_grace(), Duration::ZERO);

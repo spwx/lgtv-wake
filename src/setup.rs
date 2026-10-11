@@ -15,7 +15,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::config::{self, Config};
 use crate::tv;
-use crate::watch::CONTROLLER_NAME;
+use crate::watch::is_controller;
 
 const UNIT_FILE: &str = "tv-controller@.service";
 pub const UNIT: &str = include_str!("../deploy/tv-controller@.service");
@@ -208,7 +208,7 @@ broadcast = "{broadcast}"
 input = "{input}"
 # optional, with these defaults:
 # wake_delay_secs = 5
-# long_press_secs = 5
+# long_press_secs = 3
 # wake_timeout_secs = 20
 # idle_off_mins = 15   # Game Mode only; 0 disables
 # off_grace_secs = 30  # ignore keyboard and mouse this long after turning the TV off
@@ -291,7 +291,7 @@ fn units_to_restart(list_units: &str, class_input: &Path) -> Vec<String> {
                 return false;
             }
             fs::read_to_string(class_input.join(event).join("device/name"))
-                .is_ok_and(|name| name.trim_end_matches(['\n', '\r']) != CONTROLLER_NAME)
+                .is_ok_and(|name| !is_controller(&name))
         })
         .map(String::from)
         .collect()
@@ -444,6 +444,7 @@ pub fn run_cmd(program: &str, args: &[&str]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::watch::CONTROLLER_NAMES;
 
     // `/proc/net/route` from a /22 network, written for a little-endian host.
     const ROUTES: &str = "\
@@ -497,11 +498,13 @@ docker0\t000011AC\t00000000\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0
         let t = TempDir::new();
         t.device("event3", "AT Translated Set 2 keyboard");
         t.device("event7", "Logitech USB Receiver Mouse");
-        t.device("event17", CONTROLLER_NAME);
+        t.device("event17", CONTROLLER_NAMES[0]);
+        t.device("event15", CONTROLLER_NAMES[1]);
         // An eventN without a readable name (removed meanwhile) is skipped.
         fs::create_dir_all(t.0.join("event30")).unwrap();
         let list = "\
 tv-controller@event3.service  loaded active running Watch event3 for the TV
+tv-controller@event15.service loaded active running Watch event15 for the TV
 tv-controller@event17.service loaded active running Watch event17 for the TV
 tv-controller@event30.service loaded active running Watch event30 for the TV
 tv-controller@event7.service  loaded active running Watch event7 for the TV

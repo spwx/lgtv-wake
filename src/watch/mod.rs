@@ -9,8 +9,19 @@ use std::io;
 use std::ops::RangeInclusive;
 use std::path::Path;
 
-/// Device name of the real controller (Steam's virtual pad has a different name).
-pub const CONTROLLER_NAME: &str = "Xbox Wireless Controller";
+/// Device names of the real controllers (Steam's virtual pad has a different name): the Xbox
+/// controller over Bluetooth, and the 8BitDo Ultimate 2C on its 2.4 GHz dongle, whose input
+/// devices come and go with the controller although the dongle stays plugged in. Keep in sync
+/// with the udev rule.
+pub const CONTROLLER_NAMES: &[&str] = &[
+    "Xbox Wireless Controller",
+    "8BitDo Ultimate 2C Wireless Controller",
+];
+
+/// Whether `name`, as read from sysfs (with or without its trailing newline), is a controller.
+pub fn is_controller(name: &str) -> bool {
+    CONTROLLER_NAMES.contains(&name.trim_end_matches(['\n', '\r']))
+}
 
 pub const SYSFS_INPUT: &str = "/sys/class/input";
 
@@ -27,7 +38,7 @@ fn is_press(code: u16, value: i32) -> bool {
 }
 
 /// Count `eventN` entries under `class_input` (normally `/sys/class/input`) whose
-/// `device/name` is [`CONTROLLER_NAME`], skipping the one named `own`.
+/// `device/name` is a controller ([`is_controller`]), skipping the one named `own`.
 ///
 /// Entries whose name can't be read (e.g. removed while we look) are skipped.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -42,7 +53,7 @@ fn count_controllers_in(class_input: &Path, own: Option<&OsStr>) -> io::Result<u
         let Ok(name) = fs::read_to_string(entry.path().join("device/name")) else {
             continue;
         };
-        if name.trim_end_matches(['\n', '\r']) == CONTROLLER_NAME {
+        if is_controller(&name) {
             count += 1;
         }
     }
@@ -63,7 +74,7 @@ pub fn controller_macs_in(class_input: &Path) -> io::Result<Vec<String>> {
         let Ok(name) = fs::read_to_string(device.join("name")) else {
             continue;
         };
-        if name.trim_end_matches(['\n', '\r']) != CONTROLLER_NAME {
+        if !is_controller(&name) {
             continue;
         }
         let Ok(uniq) = fs::read_to_string(device.join("uniq")) else {
@@ -96,7 +107,7 @@ mod linux {
     use tracing::{error, info, warn};
 
     use super::machine::{Action, Event, Machine};
-    use super::{CONTROLLER_NAME, SYSFS_INPUT, count_controllers_in, is_press};
+    use super::{SYSFS_INPUT, count_controllers_in, is_controller, is_press};
     use crate::config::Config;
     use crate::marks::Mark;
     use crate::tv;
@@ -136,13 +147,13 @@ mod linux {
         Fatal(io::Error),
     }
 
-    /// Watch one input device until it disappears, acting on the TV: the Xbox controller with
+    /// Watch one input device until it disappears, acting on the TV: a controller with
     /// [`controller`], anything else (a keyboard or mouse, per the udev rule) with [`desk`].
     pub async fn run(cfg: &Config, device: &Path) -> Result<()> {
         let path = device.display().to_string();
         let dev = open(device, &path).await?;
         let name = dev.name().unwrap_or_default().to_owned();
-        if name == CONTROLLER_NAME {
+        if is_controller(&name) {
             controller(cfg, device, dev, &name, &path).await
         } else {
             desk(cfg, dev, &name, &path).await
@@ -250,11 +261,14 @@ mod linux {
         // Resolve our own eventN now: once the device is gone, the node is too.
         let own = own_event_name(device);
 
+        // Bluetooth address, for the idle-off disconnect. A controller without one (on a
+        // dongle or USB) can't be powered off from here, so it gets no idle-off.
+        let mac = dev.unique_name().unwrap_or_default().to_owned();
+        let idle_off = if mac.is_empty() { None } else { cfg.idle_off() };
+
         let origin = Instant::now();
         let now = || origin.elapsed();
-        let mut machine = Machine::new(now(), cfg.wake_delay(), cfg.long_press(), cfg.idle_off());
-        // Bluetooth address, for the idle-off disconnect.
-        let mac = dev.unique_name().unwrap_or_default().to_owned();
+        let mut machine = Machine::new(now(), cfg.wake_delay(), cfg.long_press(), idle_off);
         let mut events = dev
             .into_event_stream()
             .with_context(|| format!("reading {path}"))?;
@@ -498,13 +512,19 @@ mod tests {
     fn fake_sysfs() -> TempDir {
         let t = TempDir::new();
         t.device("event3", "AT Translated Set 2 keyboard");
-        t.device("event17", CONTROLLER_NAME);
-        t.device("event21", CONTROLLER_NAME);
+        t.device("event17", CONTROLLER_NAMES[0]);
+        t.device("event21", CONTROLLER_NAMES[0]);
+        t.device("event15", "8BitDo Ultimate 2C Wireless Controller");
+        // The dongle's keyboard and mouse aren't the controller.
+        t.device(
+            "event16",
+            "8BitDo 8BitDo Ultimate 2C Wireless Controller Keyboard",
+        );
         t.device("event22", "Microsoft X-Box 360 pad 0");
         t.device("event23", "Xbox Wireless Controller Consumer Control");
         // Non-event entries for the same controller must not count.
-        t.device("input42", CONTROLLER_NAME);
-        t.device("js0", CONTROLLER_NAME);
+        t.device("input42", CONTROLLER_NAMES[0]);
+        t.device("js0", CONTROLLER_NAMES[0]);
         // An eventN without a readable name (removed meanwhile) is skipped.
         fs::create_dir_all(t.0.join("event30")).unwrap();
         t
@@ -514,16 +534,16 @@ mod tests {
     fn counts_other_controllers() {
         let t = fake_sysfs();
         let count = |own: Option<&str>| count_controllers_in(&t.0, own.map(OsStr::new)).unwrap();
-        assert_eq!(count(Some("event17")), 1);
-        assert_eq!(count(Some("event21")), 1);
-        assert_eq!(count(Some("event3")), 2);
-        assert_eq!(count(None), 2);
+        assert_eq!(count(Some("event17")), 2);
+        assert_eq!(count(Some("event15")), 2);
+        assert_eq!(count(Some("event3")), 3);
+        assert_eq!(count(None), 3);
     }
 
     #[test]
     fn only_controller_counts_zero() {
         let t = TempDir::new();
-        t.device("event17", CONTROLLER_NAME);
+        t.device("event17", CONTROLLER_NAMES[0]);
         t.device("event5", "Power Button");
         assert_eq!(
             count_controllers_in(&t.0, Some(OsStr::new("event17"))).unwrap(),
@@ -565,7 +585,7 @@ mod tests {
         uniq("event17", "ac:8e:bd:46:22:70");
         // The same controller's other event device, and a USB one with no address.
         fs::create_dir_all(t.0.join("event18/device")).unwrap();
-        fs::write(t.0.join("event18/device/name"), CONTROLLER_NAME).unwrap();
+        fs::write(t.0.join("event18/device/name"), CONTROLLER_NAMES[0]).unwrap();
         uniq("event18", "ac:8e:bd:46:22:70");
         uniq("event21", "");
         uniq("event3", "ed:90:92:e0:26:18");

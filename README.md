@@ -1,8 +1,12 @@
 # lgtv-wake
 
-Turns an LG webOS TV on and switches it to the gaming PC's input when an Xbox
+Turns an LG webOS TV on and switches it to the gaming PC's input when a
 controller connects on Linux, or a key or mouse button is pressed, and turns it
 off when the last controller is switched off with a long press of the Xbox button.
+
+Supported controllers: the Xbox Wireless Controller over Bluetooth, and the
+8BitDo Ultimate 2C Wireless Controller on its 2.4 GHz dongle (its home button
+is the Xbox button here).
 
 udev starts one `lgtv-wake watch` process per connected controller, keyboard and
 mouse, as a systemd user unit. The process watches the device's buttons and exits
@@ -22,7 +26,8 @@ when the device disconnects.
   while a keyboard or mouse has been used (moved, scrolled or pressed) within
   `idle_off_mins`, so a keyboard-and-mouse game keeps the TV on. Set
   `idle_off_mins = 0` to turn this off. This uses `loginctl` (to read the
-  session's desktop) and `bluetoothctl`.
+  session's desktop) and `bluetoothctl`. A controller on a dongle has no
+  Bluetooth connection to drop, so it gets no idle off.
 - **Keyboard and mouse:** a key press or mouse click (not movement or
   scrolling) on a USB or Bluetooth keyboard or mouse, including ones with
   their own dongle, turns the TV on and switches to `input`. Each device does
@@ -113,7 +118,7 @@ broadcast = "192.168.1.255"
 input = "HDMI_1"
 # optional, with these defaults:
 # wake_delay_secs = 5
-# long_press_secs = 5
+# long_press_secs = 3
 # wake_timeout_secs = 20
 # idle_off_mins = 15
 # off_grace_secs = 30
